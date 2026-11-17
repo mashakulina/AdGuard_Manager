@@ -11,6 +11,7 @@ from core.ui_tasks import TaskRunner
 from core.update_diagnostics import has_error
 from ui.components.adaptive import AdaptivePage
 from ui.components.button_styler import create_hover_button
+from ui.components.touch_input import install_touch_support
 
 
 def classify_license(result):
@@ -74,6 +75,7 @@ class StartupCheckWindow:
         create_hover_button(self.page.footer, text='Отмена', command=self.cancel, **style).pack(side=tk.LEFT)
         self.page.responsive_row(self.page.footer, gap=10)
         self.page.request_fit()
+        self._touch_input = install_touch_support(self.root)
         self.retry()
 
     @staticmethod

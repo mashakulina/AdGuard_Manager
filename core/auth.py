@@ -1,5 +1,6 @@
 from core.ui_scaling import grab_when_visible
 from ui.components.adaptive import AdaptivePage
+from ui.components.touch_input import install_touch_support
 import tkinter as tk
 import subprocess
 import re
@@ -51,6 +52,7 @@ class SudoAuthWindow:
         self.setup_ui()
         self.tasks = TaskRunner(self.root)
         self.root.protocol('WM_DELETE_WINDOW', self.cancel)
+        self._touch_input = install_touch_support(self.root)
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
@@ -457,6 +459,7 @@ class AuthWindow(_AuthFlow):
         self.countdown_running = False
         self.setup_ui()
         self._init_auth_flow()
+        self._touch_input = install_touch_support(self.root)
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""

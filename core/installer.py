@@ -1,4 +1,5 @@
 from ui.components.adaptive import AdaptivePage
+from ui.components.touch_input import install_touch_support
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import subprocess
@@ -32,6 +33,7 @@ class AdGuardVPNInstaller:
         self.filesystem_unlocked = False
         self.installation_complete = False  # Флаг завершения установки
         self.setup_ui()
+        self._touch_input = install_touch_support(self.root)
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""

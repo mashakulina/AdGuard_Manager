@@ -1,4 +1,5 @@
 from core.ui_tasks import TaskRunner
+from ui.components.touch_input import install_touch_support
 from utils.browser import open_url
 from core.ui_scaling import place_popup, observe_window, snapshot
 from types import SimpleNamespace
@@ -137,6 +138,7 @@ class AdGuardVPNManager:
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
         self.setup_gui()
+        self._touch_input = install_touch_support(self.root)
         if initial_license is not None:
             self._apply_refresh(self._refresh_generation, {'license': initial_license})
             self._last_license_refresh = time.monotonic()
