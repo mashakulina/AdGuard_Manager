@@ -1,13 +1,35 @@
+from core.ui_scaling import grab_when_visible
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
-from tkinter import messagebox
 import subprocess
-import threading
 import re
 import os
-import time
-import webbrowser
-import sys
-from ui.components.button_styler import create_hover_button, apply_hover_effect
+from ui.components.button_styler import create_hover_button
+from core.ui_tasks import TaskRunner
+from core.auth_session import AuthSession, LoginResult
+from core.auth_diagnostics import sanitize, failure_summary, format_diagnostics
+from dataclasses import replace
+from utils.browser import open_url
+
+class _AuthURLLabel(tk.Label):
+    """Keep the optional authorization URL out of the layout until available."""
+    def configure(self, cnf=None, **kwargs):
+        result = super().configure(cnf, **kwargs)
+        options = dict(cnf or {}) if isinstance(cnf, dict) else {}
+        options.update(kwargs)
+        if 'text' in options:
+            if options['text']:
+                self.pack(fill=tk.X, pady=(5, 0))
+            else:
+                self.pack_forget()
+                self.master.configure(height=1)
+            callback = getattr(self, '_request_fit', None)
+            if callback is not None:
+                callback()
+        return result
+
+    config = configure
+
 
 class SudoAuthWindow:
     """Окно авторизации через sudo"""
@@ -15,7 +37,6 @@ class SudoAuthWindow:
         self.root = tk.Tk()
         self.setup_window_properties()
         self.root.title("Аутентификация")
-        self.root.geometry("260x290")
         self.root.configure(bg='#182030')
 
         try:
@@ -28,6 +49,8 @@ class SudoAuthWindow:
         self.sudo_password = None
         self.auth_success = False
         self.setup_ui()
+        self.tasks = TaskRunner(self.root)
+        self.root.protocol('WM_DELETE_WINDOW', self.cancel)
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
@@ -45,23 +68,25 @@ class SudoAuthWindow:
             icon_path = os.path.join(manager_dir, "ico/adguard.png")
             if os.path.exists(icon_path):
                 # Для PNG файлов в tkinter
-                icon = tk.PhotoImage(file=icon_path)
+                icon = tk.PhotoImage(master=self.root, file=icon_path)
                 self.root.iconphoto(True, icon)
         except Exception as e:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (370, 360), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="Аутентификация",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
-        title_label.pack(pady=10)
+        title_label.pack(fill=tk.X, pady=10)
+        self.page.wrap(title_label)
 
         desc_label = tk.Label(main_frame,
                              text="Для установки AdGuard VPN\nтребуется права администратора",
                              font=("Arial", 10), fg='white', bg='#182030')
-        desc_label.pack(pady=5)
+        desc_label.pack(fill=tk.X, pady=5)
+        self.page.wrap(desc_label)
 
         sudo_frame = tk.Frame(main_frame, bg='#182030')
         sudo_frame.pack(fill=tk.X, pady=10)
@@ -69,13 +94,13 @@ class SudoAuthWindow:
         tk.Label(sudo_frame, text="Введите пароль:",
                 fg='white', bg='#182030').pack(anchor=tk.W)
 
-        self.sudo_entry = tk.Entry(sudo_frame, show="*", width=40, font=('Arial', 12),
+        self.sudo_entry = tk.Entry(sudo_frame, show="*", width=1, font=('Arial', 12),
                                   bg='#15354D', fg='white', insertbackground='white')
         self.sudo_entry.pack(fill=tk.X, pady=5)
         self.sudo_entry.bind('<Return>', self.verify_sudo)
         self.sudo_entry.focus()
 
-        btn_frame = tk.Frame(main_frame, bg='#182030')
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
         btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
@@ -105,7 +130,11 @@ class SudoAuthWindow:
         self.status_var = tk.StringVar(value="Введите пароль")
         status_bar = tk.Label(main_frame, textvariable=self.status_var,
                              relief=tk.SUNKEN, anchor=tk.W, bg='#15354D', fg='white')
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        status_bar.pack(fill=tk.X, pady=(5, 0))
+        self.page.wrap(status_bar)
+
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def verify_sudo(self, event=None):
         password = self.sudo_entry.get()
@@ -116,30 +145,30 @@ class SudoAuthWindow:
         self.status_var.set("🔐 Проверка пароля...")
         self.sudo_entry.config(state='disabled')
 
-        thread = threading.Thread(target=self._verify_sudo_thread, args=(password,))
-        thread.daemon = True
-        thread.start()
+        self.tasks.submit(lambda: self._verify_sudo_thread(password),
+                          lambda valid: self._sudo_result(password, valid),
+                          lambda error: self._sudo_verified_fail('Ошибка проверки пароля'),
+                          key='sudo')
 
     def _verify_sudo_thread(self, password):
+        process = subprocess.Popen(
+            ['sudo', '-S', 'echo', 'success'], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            process = subprocess.Popen(
-                ['sudo', '-S', 'echo', 'success'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            output, error = process.communicate(input=password + '\n')
+            process.communicate(input=password + '\n', timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return False
+        return process.returncode == 0
 
-            if process.returncode == 0:
-                self.sudo_password = password
-                self.auth_success = True
-                self.root.after(0, self._sudo_verified_success)
-            else:
-                self.root.after(0, lambda: self._sudo_verified_fail("❌ Неверный пароль"))
-
-        except Exception as e:
-            self.root.after(0, lambda: self._sudo_verified_fail(f"Ошибка: {str(e)}"))
+    def _sudo_result(self, password, valid):
+        if valid:
+            self.sudo_password = password
+            self.auth_success = True
+            self._sudo_verified_success()
+        else:
+            self._sudo_verified_fail('❌ Неверный пароль')
 
     def _sudo_verified_success(self):
         self.status_var.set("✅ Пароль подтвержден!")
@@ -152,75 +181,264 @@ class SudoAuthWindow:
         self.sudo_entry.focus()
 
     def close_and_proceed(self):
+        self.tasks.close()
         self.root.destroy()
 
     def cancel(self):
         self.sudo_password = None
         self.auth_success = False
+        self.tasks.close()
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
         return self.sudo_password, self.auth_success
 
-class AuthWindow:
+class _AuthFlow:
+    """Shared login state machine; all methods here run on the Tk thread."""
+    def _init_auth_flow(self):
+        self.tasks = TaskRunner(self.root)
+        self._session = None
+        self._closed = False
+        self._tick_id = None
+        self._generation = 0
+        self._last_login_result = None
+        self._details_window = None
+        self.details_btn = create_hover_button(
+            self.page.footer, text='Подробности', command=self.show_auth_details,
+            font=('Arial', 10), bg='#15354D', fg='white', bd=0,
+            padx=10, pady=5, highlightthickness=0, cursor='hand2')
+        self.root.protocol('WM_DELETE_WINDOW', self.cancel)
+        self.root.bind('<Destroy>', self._auth_destroyed, add='+')
+        self.url_label.bind('<Button-1>', lambda event: self.copy_auth_url())
+
+    def _auth_destroyed(self, event):
+        if event.widget is self.root:
+            self._stop_auth()
+            self.tasks.close()
+            self._closed = True
+
+    def _stop_auth(self):
+        self.monitoring = False
+        if self._session is not None:
+            self._session.cancel()
+        if self._tick_id is not None:
+            self.root.after_cancel(self._tick_id)
+            self._tick_id = None
+
+    def cancel(self):
+        self._stop_auth()
+        self.tasks.close()
+        self._closed = True
+        self.root.destroy()
+
+    def close_app(self):
+        self.cancel()
+
+    def start_auth_process(self):
+        if self._closed or self.auth_success:
+            return
+        session = AuthSession()
+        if not self.tasks.submit(
+                lambda: session.run(lambda url: self.tasks.post(self._session_url, session, url)),
+                lambda result: self._login_done(session, result),
+                lambda error: self._login_error(session, error), key='login'):
+            return
+        self._generation += 1
+        self._clear_auth_diagnostics()
+        self._session = session
+        self.auth_url = None
+        self.url_label.config(text='')
+        self.browser_btn.config(state='disabled', text='Открыть в браузере')
+        self.check_now_btn.config(state='disabled')
+        self.status_var.set('Получение ссылки для авторизации...')
+
+    def _session_url(self, session, url):
+        if session is self._session and not self.auth_success and not session.cancelled.is_set():
+            self._show_auth_url(url)
+
+    def _show_auth_url(self, auth_url):
+        self.auth_url = auth_url
+        display_url = auth_url if len(auth_url) <= 60 else auth_url[:60] + '...'
+        self.url_label.config(text=display_url)
+        self.status_var.set('Ссылка получена. Нажмите её для копирования или откройте браузер.')
+        self.browser_btn.config(state='normal', text='Открыть в браузере')
+        self.check_now_btn.config(state='normal')
+        if not self.monitoring:
+            self.monitoring = True
+            self.current_countdown = 20
+            self._tick_id = self.root.after(1000, self._auth_tick)
+
+    def _login_done(self, session, result):
+        if self._closed or session is not self._session or self.auth_success or session.cancelled.is_set():
+            return
+        if result.state == 'exited' and result.returncode == 0:
+            self.force_check_auth()
+        elif result.state not in ('busy', 'cancelled'):
+            self._auth_fail(failure_summary(result), result)
+
+    def _login_error(self, session, error=None):
+        if (not self._closed and session is self._session and not self.auth_success
+                and not session.cancelled.is_set()):
+            result = LoginResult('worker_error', start_error=sanitize(error or 'Ошибка фоновой задачи', limit=1024))
+            self._auth_fail(failure_summary(result), result)
+
+    def _clear_auth_diagnostics(self):
+        self._last_login_result = None
+        self.details_btn.pack_forget()
+        if self._details_window is not None:
+            if self._details_window.winfo_exists():
+                self._details_window.destroy()
+            self._details_window = None
+
+    def _auth_fail(self, error_msg, result=None):
+        self._stop_auth()
+        self._generation += 1
+        self._session = None
+        self.browser_btn.config(state='normal', text='Получить ссылку')
+        self.check_now_btn.config(state='normal' if self.auth_url else 'disabled')
+        self.status_var.set(error_msg)
+        if result is not None:
+            self._last_login_result = replace(result, output=sanitize(result.output),
+                                              start_error=sanitize(result.start_error, limit=1024))
+            self.details_btn.pack(pady=5)
+
+    def show_auth_details(self):
+        """Show safe diagnostics and return the Toplevel (also used by renderers)."""
+        if self._closed or self._last_login_result is None:
+            return None
+        if self._details_window is not None and self._details_window.winfo_exists():
+            self._details_window.lift()
+            return self._details_window
+        dialog = tk.Toplevel(self.root)
+        self._details_window = dialog
+        dialog.title('Подробности авторизации')
+        dialog.configure(bg='#182030')
+        dialog.transient(self.root)
+        page = AdaptivePage(dialog, (680, 420), self.root)
+        frame = tk.Frame(page.body, bg='#182030')
+        frame.pack(fill='both', expand=True)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        from tkinter import ttk
+        text = tk.Text(frame, font=('Arial', 10), bg='#15354D', fg='white',
+                       wrap='word', width=1, height=1, bd=0, highlightthickness=0,
+                       padx=5, pady=5, cursor='arrow')
+        content = failure_summary(self._last_login_result) + '\n\n' + format_diagnostics(self._last_login_result)
+        text.insert('1.0', content)
+        text.config(state='disabled')
+        text.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(frame, orient='vertical', command=text.yview)
+        text.config(yscrollcommand=scrollbar.set)
+        page.text_block(text, scrollbar, preferred_lines=16)
+        buttons = tk.Frame(page.footer, bg='#182030')
+        buttons.pack(fill='x')
+        def copy():
+            dialog.clipboard_clear()
+            dialog.clipboard_append(content)
+        style = dict(font=('Arial', 10), bg='#15354D', fg='white', bd=0,
+                     padx=12, pady=7, highlightthickness=0, cursor='hand2')
+        create_hover_button(buttons, text='Копировать', command=copy, **style).pack(side='left')
+        create_hover_button(buttons, text='Закрыть', command=dialog.destroy, **style).pack(side='left')
+        page.responsive_row(buttons)
+        dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
+        dialog.auth_diagnostics_text = text
+        dialog.auth_diagnostics_page = page
+        page.request_fit()
+        return dialog
+
+    def open_auth_browser(self):
+        if self._session is None:
+            self.start_auth_process()
+            return
+        if not self.auth_url or self.auth_success:
+            return
+        url = self.auth_url
+        self.status_var.set('Открываю браузер...')
+        session = self._session
+        self.tasks.submit(lambda: open_url(url),
+                          lambda opened: self._browser_done(opened, session),
+                          lambda error: self._browser_done(False, session), key='browser')
+
+    def _browser_done(self, opened, session):
+        if self.auth_success or session is not self._session:
+            return
+        self.status_var.set('Ожидание авторизации...' if opened else
+                            'Не удалось открыть браузер. Нажмите ссылку для копирования и откройте её вручную.')
+        self.browser_btn.config(state='normal')
+        self.check_now_btn.config(state='normal')
+
+    def copy_auth_url(self):
+        if self.auth_url:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.auth_url)
+            self.status_var.set('Ссылка скопирована в буфер обмена!')
+
+    def _auth_tick(self):
+        self._tick_id = None
+        if not self.monitoring or self._closed:
+            return
+        self.current_countdown -= 1
+        if self.current_countdown <= 0:
+            self.force_check_auth()
+            self.current_countdown = 20
+        self._tick_id = self.root.after(1000, self._auth_tick)
+
+    def force_check_auth(self):
+        if self._closed or self.auth_success or not self.auth_url:
+            return
+        def check():
+            result = subprocess.run(['adguardvpn-cli', 'license'],
+                                    capture_output=True, text=True, timeout=10)
+            clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', result.stdout)
+            return result.returncode == 0 and bool(re.search(r'Logged in as\s+\S+', clean))
+        session, generation = self._session, self._generation
+        def current():
+            return (not self._closed and generation == self._generation
+                    and session is self._session
+                    and (session is None or not session.cancelled.is_set()))
+        if self.tasks.submit(check,
+                             lambda success: self._checked(success) if current() else None,
+                             lambda error: self._check_error() if current() else None, key='auth-check'):
+            self.check_now_btn.config(state='disabled')
+            self.status_var.set('Проверка авторизации...')
+            self.current_countdown = 20
+
+    def _check_failed(self, error_msg=None):
+        """Apply a caller-provided check error on the Tk thread."""
+        self.check_now_btn.config(state='normal')
+        self.status_var.set(error_msg or 'Авторизация ещё не завершена. Повторная проверка через 20 секунд.')
+
+    def _check_error(self):
+        if not self.auth_success:
+            self.check_now_btn.config(state='normal')
+            self.status_var.set('Не удалось проверить авторизацию. Повторная проверка через 20 секунд.')
+
+    def _checked(self, success):
+        if self.auth_success:
+            return
+        if success:
+            self._auth_success()
+        else:
+            self.check_now_btn.config(state='normal')
+            self.status_var.set('Авторизация ещё не завершена. Повторная проверка через 20 секунд.')
+
+    def _auth_success(self):
+        self._stop_auth()
+        self._clear_auth_diagnostics()
+        self.auth_success = True
+        self.status_var.set('✅ Авторизация успешна!')
+        self.check_now_btn.config(state='disabled')
+        self.browser_btn.config(state='disabled')
+        self._tick_id = self.root.after(2000, self.cancel)
+
+
+class AuthWindow(_AuthFlow):
     """Окно авторизации после установки"""
     def __init__(self):
         self.root = tk.Tk()
         self.setup_window_properties()
         self.root.title("AdGuard VPN - Авторизация")
-
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 425
-        base_height = 320
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 20, screen_width + 20)
-            height = min(base_height + 40, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
 
         self.root.configure(bg='#182030')
 
@@ -238,6 +456,7 @@ class AuthWindow:
         self.check_count = 0
         self.countdown_running = False
         self.setup_ui()
+        self._init_auth_flow()
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
@@ -252,27 +471,29 @@ class AuthWindow:
             manager_dir = os.path.expanduser("~/AdGuard VPN Manager")
             icon_path = os.path.join(manager_dir, "ico/adguard.png")
             if os.path.exists(icon_path):
-                icon = tk.PhotoImage(file=icon_path)
+                icon = tk.PhotoImage(master=self.root, file=icon_path)
                 self.root.iconphoto(True, icon)
         except Exception as e:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (460, 360), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="AdGuard VPN - Авторизация",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
-        title_label.pack(pady=10)
+        title_label.pack(fill=tk.X, pady=10)
+        self.page.wrap(title_label)
 
         # Фрейм для ссылки
         self.url_frame = tk.Frame(main_frame, bg='#182030')
-        self.url_frame.pack(fill=tk.X, pady=10)
+        self.url_frame.pack(fill=tk.X)
 
-        self.url_label = tk.Label(self.url_frame, text="", font=("Arial", 9),
+        self.url_label = _AuthURLLabel(self.url_frame, text="", font=("Arial", 9),
                                  wraplength=400, justify=tk.LEFT,
                                  fg='#0a84ff', bg='#182030', cursor="hand2")
-        self.url_label.pack(pady=5)
+        self.page.wrap(self.url_label)
+        self.url_label._request_fit = self.page.request_fit
 
         # Фрейм для инструкций
         instructions_frame = tk.Frame(main_frame, bg='#182030')
@@ -284,12 +505,14 @@ class AuthWindow:
             "3. Дождитесь завершения авторизации\n"
             "4. Для ускоренной проверки нажмите 'Проверить сейчас'"
         )
-        tk.Label(instructions_frame, text=instructions_text, font=("Arial", 9),
-                fg='white', bg='#182030', justify=tk.LEFT).pack(anchor=tk.W)
+        instructions_label = tk.Label(instructions_frame, text=instructions_text, font=("Arial", 9),
+                fg='white', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        instructions_label.pack(fill=tk.X)
+        self.page.wrap(instructions_label)
 
         # Кнопки основного действия
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(pady=10)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
             'font': ('Arial', 10),
@@ -316,7 +539,7 @@ class AuthWindow:
         btn_frame.grid_columnconfigure(1, weight=1)
 
         # Кнопка для ускоренной проверки
-        self.check_now_btn = create_hover_button(main_frame, text="🔄 Проверить сейчас", command=self.force_check_auth, ** button_style)
+        self.check_now_btn = create_hover_button(self.page.footer, text="🔄 Проверить сейчас", command=self.force_check_auth, ** button_style)
         self.check_now_btn.pack(pady=5)
         self.check_now_btn.config(state='disabled')  # Изначально неактивна
 
@@ -324,226 +547,31 @@ class AuthWindow:
         self.status_var = tk.StringVar(value="Нажмите кнопку для получения ссылки")
         status_bar = tk.Label(main_frame, textvariable=self.status_var,
                              relief=tk.SUNKEN, anchor=tk.W, bg='#15354D', fg='white')
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        status_bar.pack(fill=tk.X, pady=(5, 0))
+        self.page.wrap(status_bar)
 
         # Изначально скрываем кнопки до получения ссылки
         self.browser_btn.config(state='disabled')
 
-    def close_app(self):
-        self.monitoring = False
-        sys.exit()
-
-    def get_auth_url(self):
-        """Получает ссылку для авторизации из команды adguardvpn-cli login"""
-        try:
-            self.status_var.set("Получение ссылки для авторизации...")
-
-            process = subprocess.Popen(
-                ['adguardvpn-cli', 'login'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            time.sleep(2)
-
-            auth_url = None
-            output_text = ""
-
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    output_text += line
-                    url_match = re.search(r'https://[^\s]+', line)
-                    if url_match:
-                        auth_url = url_match.group(0)
-                        break
-
-            if not auth_url:
-                error_output = process.stderr.read()
-                url_match = re.search(r'https://[^\s]+', error_output)
-                if url_match:
-                    auth_url = url_match.group(0)
-
-            if auth_url:
-                self.auth_url = auth_url
-                return auth_url
-            else:
-                return None
-
-        except Exception as e:
-            return None
-
-    def open_auth_browser(self):
-        if not self.auth_url:
-            return
-
-        self.status_var.set("Открываю браузер...")
-        webbrowser.open(self.auth_url)
-
-        self.status_var.set("Проверка авторизации")
-        self.browser_btn.config(state='disabled')
-        self.check_now_btn.config(state='normal')  # Активируем кнопку проверки
-
-        # Запускаем мониторинг статуса авторизации
-        self.monitoring = True
-        thread = threading.Thread(target=self._monitor_auth_status)
-        thread.daemon = True
-        thread.start()
-
-    def force_check_auth(self):
-        """Принудительная проверка статуса авторизации"""
-        if not self.monitoring:
-            return
-
-        self.status_var.set("⏩ Принудительная проверка...")
-        self.check_now_btn.config(state='disabled')  # Временно отключаем кнопку
-
-        # Прерываем текущий обратный отсчет
-        self.countdown_running = False
-
-        # Запускаем проверку в отдельном потоке
-        thread = threading.Thread(target=self._perform_auth_check)
-        thread.daemon = True
-        thread.start()
-
-    def _perform_auth_check(self):
-        """Выполняет проверку статуса авторизации"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'list-locations'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.auth_success = True
-                self.root.after(0, self._auth_success)
-            else:
-                self.root.after(0, self._check_failed)
-
-        except Exception as e:
-            self.root.after(0, lambda: self._check_failed(f"Ошибка: {str(e)}"))
-
-    def _check_failed(self, error_msg=None):
-        """Обработка неудачной проверки"""
-        if error_msg:
-            self.status_var.set(f"❌ {error_msg}")
-        else:
-            self.status_var.set("❌ Авторизация еще не завершена")
-
-        # Через 3 секунды возвращаем к обычному циклу
-        self.root.after(3000, self._resume_normal_check)
-
-    def _resume_normal_check(self):
-        """Возобновление обычного цикла проверки"""
-        if self.monitoring:
-            self.status_var.set("Возобновление автоматической проверки...")
-            self.check_now_btn.config(state='normal')
-            # Следующая проверка начнется автоматически в основном цикле
-
-    def copy_auth_url(self):
-        """Копирует ссылку авторизации в буфер обмена"""
-        if self.auth_url:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.auth_url)
-            self.status_var.set("Ссылка скопирована в буфер обмена!")
-
-    def start_auth_process(self):
-        """Начинает процесс авторизации"""
-        thread = threading.Thread(target=self._start_auth_thread)
-        thread.daemon = True
-        thread.start()
-
-    def _start_auth_thread(self):
-        """Поток для получения ссылки авторизации"""
-        auth_url = self.get_auth_url()
-
-        if auth_url:
-            self.root.after(0, lambda: self._show_auth_url(auth_url))
-        else:
-            self.root.after(0, lambda: self._auth_fail("❌ Не удалось получить ссылку для авторизации"))
-
-    def _show_auth_url(self, auth_url):
-        """Показывает полученную ссылку в интерфейсе"""
-        display_url = auth_url
-        if len(display_url) > 60:
-            display_url = display_url[:60] + "..."
-
-        self.url_label.config(text=display_url)
-        self.status_var.set("✅ Ссылка получена! Нажмите 'Открыть в браузере'")
-
-        self.browser_btn.config(state='normal')
-
-    def _monitor_auth_status(self):
-        """Мониторит статус авторизации с цикличной проверкой каждые 20 секунд"""
-        self.check_count = 0
-
-        while self.monitoring:
-            try:
-                self.check_count += 1
-                self.countdown_running = True
-
-                # Показываем обратный отсчет 20 секунд
-                for countdown in range(20, 0, -1):
-                    if not self.monitoring:
-                        return
-                    if not self.countdown_running:
-                        break  # Прерываем отсчет если была принудительная проверка
-
-                    self.current_countdown = countdown
-                    self.root.after(0, lambda c=countdown: self.status_var.set(
-                        f"Проверка авторизации через: {c} сек (попытка #{self.check_count})"
-                    ))
-                    time.sleep(1)
-
-                # Если отсчет не был прерван, выполняем проверку
-                if self.countdown_running:
-                    self._perform_auth_check()
-
-                # Сбрасываем флаг для следующего цикла
-                self.countdown_running = True
-
-                # Небольшая пауза перед следующим циклом
-                time.sleep(1)
-
-            except Exception as e:
-                # При ошибке продолжаем цикл
-                self.root.after(0, lambda: self.status_var.set(
-                    f"Ошибка проверки, повтор через 20 сек (попытка #{self.check_count})"
-                ))
-                self.countdown_running = True
-                continue
-
-    def _auth_success(self):
-        """Успешная авторизация"""
-        self.monitoring = False
-        self.countdown_running = False
-        self.status_var.set("✅ Авторизация успешна!")
-        self.auth_success = True
-        self.check_now_btn.config(state='disabled')
-        self.root.after(2000, self.root.destroy)
-
-    def _auth_fail(self, error_msg):
-        self.browser_btn.config(state='normal')
-        self.check_now_btn.config(state='disabled')
-        self.status_var.set("Ошибка авторизации")
-
-    def show_custom_question(self, title, message):
-        """Показывает кастомный вопрос с Yes/No"""
-        from ui.components.dialogs import show_question_dialog
-        return show_question_dialog(self.root, title, message)
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def run(self):
         self.start_auth_process()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self._stop_auth()
+            if self._session is not None and not self._session.wait(timeout=1.5):
+                # An exceptional slow cleanup must still prevent interpreter
+                # exit from abandoning this standalone login's child process.
+                import threading
+                threading.Thread(target=self._session.wait, daemon=False,
+                                 name='standalone-auth-cleanup').start()
+                raise RuntimeError('Authorization cleanup has not finished')
         return self.auth_success
 
-class ManagerAuthWindow:
+class ManagerAuthWindow(_AuthFlow):
     """Окно авторизации через менеджер"""
     def __init__(self, parent):
         self.parent = parent
@@ -551,63 +579,11 @@ class ManagerAuthWindow:
         self.setup_window_properties()
         self.root.title("AdGuard VPN - Авторизация")
 
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 425
-        base_height = 320
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 20, screen_width + 20)
-            height = min(base_height + 40, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
-
         self.root.configure(bg='#182030')
 
         # Явно позиционируем относительно родительского окна
         self.root.transient(parent)  # Связываем с родителем
-        self.root.grab_set()         # Делаем модальным
+        grab_when_visible(self.root)         # Делаем модальным
 
         try:
             from tkinter import ttk
@@ -623,6 +599,7 @@ class ManagerAuthWindow:
         self.check_count = 0
         self.countdown_running = False
         self.setup_ui()
+        self._init_auth_flow()
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
@@ -640,27 +617,29 @@ class ManagerAuthWindow:
             icon_path = os.path.join(manager_dir, "ico/adguard.png")
             if os.path.exists(icon_path):
                 # Для PNG файлов в tkinter
-                icon = tk.PhotoImage(file=icon_path)
+                icon = tk.PhotoImage(master=self.root, file=icon_path)
                 self.root.iconphoto(True, icon)
         except Exception as e:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (460, 360), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="AdGuard VPN - Авторизация",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
-        title_label.pack(pady=10)
+        title_label.pack(fill=tk.X, pady=10)
+        self.page.wrap(title_label)
 
         # Фрейм для ссылки
         self.url_frame = tk.Frame(main_frame, bg='#182030')
-        self.url_frame.pack(fill=tk.X, pady=10)
+        self.url_frame.pack(fill=tk.X)
 
-        self.url_label = tk.Label(self.url_frame, text="", font=("Arial", 9),
+        self.url_label = _AuthURLLabel(self.url_frame, text="", font=("Arial", 9),
                                  wraplength=400, justify=tk.LEFT,
                                  fg='#0a84ff', bg='#182030', cursor="hand2")
-        self.url_label.pack(pady=5)
+        self.page.wrap(self.url_label)
+        self.url_label._request_fit = self.page.request_fit
 
         # Фрейм для инструкций
         instructions_frame = tk.Frame(main_frame, bg='#182030')
@@ -672,12 +651,14 @@ class ManagerAuthWindow:
             "3. Дождитесь завершения авторизации\n"
             "4. Для ускоренной проверки нажмите 'Проверить сейчас'"
         )
-        tk.Label(instructions_frame, text=instructions_text, font=("Arial", 9),
-                fg='white', bg='#182030', justify=tk.LEFT).pack(anchor=tk.W)
+        instructions_label = tk.Label(instructions_frame, text=instructions_text, font=("Arial", 9),
+                fg='white', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        instructions_label.pack(fill=tk.X)
+        self.page.wrap(instructions_label)
 
         # Кнопки основного действия
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(pady=10)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
             'font': ('Arial', 10),
@@ -704,7 +685,7 @@ class ManagerAuthWindow:
         btn_frame.grid_columnconfigure(1, weight=1)
 
         # Кнопка для ускоренной проверки
-        self.check_now_btn = create_hover_button(main_frame, text="🔄 Проверить сейчас", command=self.force_check_auth, ** button_style)
+        self.check_now_btn = create_hover_button(self.page.footer, text="🔄 Проверить сейчас", command=self.force_check_auth, ** button_style)
         self.check_now_btn.pack(pady=5)
         self.check_now_btn.config(state='disabled')
 
@@ -712,215 +693,16 @@ class ManagerAuthWindow:
         self.status_var = tk.StringVar(value="Получение ссылки для авторизации...")
         status_bar = tk.Label(main_frame, textvariable=self.status_var,
                              relief=tk.SUNKEN, anchor=tk.W, bg='#15354D', fg='white')
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        status_bar.pack(fill=tk.X, pady=(5, 0))
+        self.page.wrap(status_bar)
 
         # Изначально скрываем кнопки до получения ссылки
         self.browser_btn.config(state='disabled')
 
-    def cancel(self):
-        """Закрывает окно авторизации"""
-        self.monitoring = False
-        self.countdown_running = False
-        self.auth_success = False
-        self.root.destroy()
-
-    def get_auth_url(self):
-        """Получает ссылку для авторизации из команды adguardvpn-cli login"""
-        try:
-            self.status_var.set("Получение ссылки для авторизации...")
-
-            process = subprocess.Popen(
-                ['adguardvpn-cli', 'login'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            time.sleep(2)
-
-            auth_url = None
-            output_text = ""
-
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    output_text += line
-                    url_match = re.search(r'https://[^\s]+', line)
-                    if url_match:
-                        auth_url = url_match.group(0)
-                        break
-
-            if not auth_url:
-                error_output = process.stderr.read()
-                url_match = re.search(r'https://[^\s]+', error_output)
-                if url_match:
-                    auth_url = url_match.group(0)
-
-            if auth_url:
-                self.auth_url = auth_url
-                return auth_url
-            else:
-                return None
-
-        except Exception as e:
-            return None
-
-    def open_auth_browser(self):
-        """Открывает ссылку авторизации в браузере и запускает мониторинг статуса"""
-        if not self.auth_url:
-            return
-
-        self.status_var.set("Открываю браузер...")
-        webbrowser.open(self.auth_url)
-
-        self.status_var.set("Ожидание авторизации...")
-        self.browser_btn.config(state='disabled')
-        self.cancel_btn.config(state='disabled')
-        self.check_now_btn.config(state='normal')  # Активируем кнопку проверки
-
-        # Запускаем мониторинг статуса авторизации
-        self.monitoring = True
-        thread = threading.Thread(target=self._monitor_auth_status)
-        thread.daemon = True
-        thread.start()
-
-    def force_check_auth(self):
-        """Принудительная проверка статуса авторизации"""
-        if not self.monitoring:
-            return
-
-        self.status_var.set("⏩ Принудительная проверка...")
-        self.check_now_btn.config(state='disabled')  # Временно отключаем кнопку
-
-        # Прерываем текущий обратный отсчет
-        self.countdown_running = False
-
-        # Запускаем проверку в отдельном потоке
-        thread = threading.Thread(target=self._perform_auth_check)
-        thread.daemon = True
-        thread.start()
-
-    def _perform_auth_check(self):
-        """Выполняет проверку статуса авторизации"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'list-locations'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.auth_success = True
-                self.root.after(0, self._auth_success)
-            else:
-                self.root.after(0, self._check_failed)
-
-        except Exception as e:
-            self.root.after(0, lambda: self._check_failed(f"Ошибка: {str(e)}"))
-
-    def _check_failed(self, error_msg=None):
-        """Обработка неудачной проверки"""
-        if error_msg:
-            self.status_var.set(f"❌ {error_msg}")
-        else:
-            self.status_var.set("❌ Авторизация еще не завершена")
-
-        # Через 3 секунды возвращаем к обычному циклу
-        self.root.after(3000, self._resume_normal_check)
-
-    def _resume_normal_check(self):
-        """Возобновление обычного цикла проверки"""
-        if self.monitoring:
-            self.status_var.set("Возобновление автоматической проверки...")
-            self.check_now_btn.config(state='normal')
-            # Следующая проверка начнется автоматически в основном цикле
-
-    def _monitor_auth_status(self):
-        """Мониторит статус авторизации с цикличной проверкой каждые 20 секунд"""
-        self.check_count = 0
-
-        while self.monitoring:
-            try:
-                self.check_count += 1
-                self.countdown_running = True
-
-                # Показываем обратный отсчет 20 секунд
-                for countdown in range(20, 0, -1):
-                    if not self.monitoring:
-                        return
-                    if not self.countdown_running:
-                        break  # Прерываем отсчет если была принудительная проверка
-
-                    self.current_countdown = countdown
-                    self.root.after(0, lambda c=countdown: self.status_var.set(
-                        f"Проверка авторизации через: {c} сек (попытка #{self.check_count})"
-                    ))
-                    time.sleep(1)
-
-                # Если отсчет не был прерван, выполняем проверку
-                if self.countdown_running:
-                    self._perform_auth_check()
-
-                # Сбрасываем флаг для следующего цикла
-                self.countdown_running = True
-
-                # Небольшая пауза перед следующим циклом
-                time.sleep(1)
-
-            except Exception as e:
-                # При ошибке продолжаем цикл
-                self.root.after(0, lambda: self.status_var.set(
-                    f"Ошибка проверки, повтор через 20 сек (попытка #{self.check_count})"
-                ))
-                self.countdown_running = True
-                continue
-
-    def _auth_success(self):
-        """Успешная авторизация"""
-        self.monitoring = False
-        self.countdown_running = False
-        self.status_var.set("✅ Авторизация успешна!")
-        self.auth_success = True
-        self.check_now_btn.config(state='disabled')
-        self.root.after(2000, self.root.destroy)  # Закрываем через 2 секунды
-
-    def _auth_fail(self, error_msg):
-        self.browser_btn.config(state='normal')
-        self.cancel_btn.config(state='normal')
-        self.check_now_btn.config(state='disabled')
-        self.status_var.set("❌ Ошибка авторизации")
-
-    def start_auth_process(self):
-        """Начинает процесс авторизации"""
-        thread = threading.Thread(target=self._start_auth_thread)
-        thread.daemon = True
-        thread.start()
-
-    def _start_auth_thread(self):
-        """Поток для получения ссылки авторизации"""
-        auth_url = self.get_auth_url()
-
-        if auth_url:
-            self.root.after(0, lambda: self._show_auth_url(auth_url))
-        else:
-            self.root.after(0, lambda: self._auth_fail("❌ Не удалось получить ссылку для авторизации"))
-
-    def _show_auth_url(self, auth_url):
-        """Показывает полученную ссылку в интерфейсе"""
-        display_url = auth_url
-        if len(display_url) > 60:
-            display_url = display_url[:60] + "..."
-
-        self.url_label.config(text=display_url)
-        self.status_var.set("✅ Ссылка получена! Нажмите 'Открыть в браузере'")
-
-        self.browser_btn.config(state='normal')
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def run(self):
         self.start_auth_process()
-        self.root.wait_window()  # Ждем закрытия окна
+        self.root.wait_window()
         return self.auth_success

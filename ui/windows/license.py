@@ -1,8 +1,9 @@
+from core.ui_tasks import TaskRunner
 import tkinter as tk
 import subprocess
 import re
 from datetime import datetime
-from ui.components.dialogs import show_message_dialog
+from ui.components.dialogs import show_message_dialog, _dialog
 
 class LicenseWindow:
     def __init__(self, parent):
@@ -155,6 +156,20 @@ class LicenseWindow:
                    "Проверьте установлен ли AdGuard VPN."
 
     def run(self):
-        """Запускает окно с информацией о лицензии"""
-        license_info = self.get_license_info()
-        show_message_dialog(self.parent, "Информация о лицензии", license_info, "info")
+        loading = 'Загрузка информации о лицензии…'
+        self.root, _ = _dialog(self.parent, 'Информация о лицензии', loading)
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        label = next(child for child in descendants(self.root)
+                     if isinstance(child, tk.Label) and child.cget('text') == loading)
+        self.tasks = TaskRunner(self.root)
+        def apply(text):
+            label.configure(text=text)
+            observer = getattr(self.root, '_scale_observer', None)
+            if observer is not None:
+                observer.refit()
+        self.tasks.submit(self.get_license_info, apply,
+                          lambda error: apply(f'❌ Ошибка: {error}'), key='license')
+        return self.root

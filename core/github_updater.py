@@ -26,11 +26,13 @@ class GitHubUpdater:
                         'description': f'Доступна новая версия менеджера: {latest_version}'
                     }
 
+            if len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
+                raise ValueError("Некорректный ответ сервера версий менеджера")
             return None, None
 
-        except Exception as e:
-            print(f"Error checking manager updates: {e}")
-            return None, None
+        except Exception:
+            # Propagate transport/format errors; callers must not report latest.
+            raise
 
     def is_newer_version(self, latest, current):
         """Простое сравнение версий"""

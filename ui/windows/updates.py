@@ -1,14 +1,19 @@
+from core.ui_scaling import grab_when_visible
+from ui.components.adaptive import AdaptivePage
 import os
 import shutil
 import tarfile
 import tempfile
+from math import ceil
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import subprocess
-import threading
 import re
 from ui.components.dialogs import show_question_dialog
 from ui.components.button_styler import create_hover_button
+from core.ui_tasks import TaskRunner
+from core.update_diagnostics import (run_command, clean_output, check_status,
+    update_succeeded, diagnostics, format_result, has_error)
 from core.github_updater import GitHubUpdater
 from config.manager_config import MANAGER_CONFIG
 
@@ -20,61 +25,9 @@ class UpdateWindow:
         self.setup_window_properties()
         self.root.title("Обновление")
 
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 480
-        base_height = 340
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 30, screen_width + 20)
-            height = min(base_height + 40, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
-
         self.root.configure(bg='#182030')
         self.root.transient(parent)
-        self.root.grab_set()
+        grab_when_visible(self.root)
 
         try:
             from tkinter import ttk
@@ -104,11 +57,34 @@ class UpdateWindow:
         self.setup_manager_section()  # Добавьте этот вызов
 
         # Загружаем сохраненный канал или используем release по умолчанию
-        self.update_channel = self.load_saved_channel()
+        self.tasks = TaskRunner(self.root)
+        self._generation = 0
+        self._channel_touched = False
+        self._cli_busy = False
+        self.update_channel = "release"
         self.setup_ui()
 
         # Устанавливаем начальное значение метки и радиокнопок
         self.update_channel_display()
+        self.channel_var.trace_add('write', self._channel_selected)
+        self.tasks.submit(lambda: (self.load_saved_channel(), self.get_adguard_current_version()),
+                          self._initial_loaded, self._initial_error, key='initial')
+
+    def _channel_selected(self, *_):
+        self._channel_touched = True
+
+    def _initial_error(self, error):
+        self.log_message(f"Ошибка начальной загрузки: {error}")
+
+    def _initial_loaded(self, values):
+        channel, version = values
+        if self._generation == 0:
+            self.current_version_label.config(text=f"Версия: {version or 'Неизвестно'}")
+            selected = self.channel_var.get() if self._channel_touched else None
+            self.update_channel = channel
+            self.update_channel_display()
+            if selected is not None:
+                self.channel_var.set(selected)
 
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
@@ -194,35 +170,12 @@ class UpdateWindow:
         pass
 
     def get_adguard_current_version(self):
-        """Получает текущую версию AdGuard VPN"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', '-v'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                # Очищаем вывод от ANSI кодов и лишних символов
-                version_output = self.clean_ansi_codes(result.stdout).strip()
-
-                # Ищем версию в формате vX.X.X или X.X.X
-                version_match = re.search(r'v?(\d+\.\d+\.\d+)', version_output)
-                if version_match:
-                    return f"{version_match.group(1)}"
-
-                # Если не нашли через regex, возвращаем как есть (очищенное)
-                return version_output if version_output else "Неизвестно"
-
-            return "Неизвестно"
-        except Exception as e:
-            print(f"Ошибка получения версии AdGuard VPN: {e}")
-            return "Неизвестно"
+        """Compatibility hook for the initial background version lookup."""
+        return self.get_current_version()
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (690, 430), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         tk.Label(main_frame, text="Обновление",
                 font=("Arial", 14, "bold"), fg='white', bg='#182030').pack(anchor=tk.CENTER, pady=(0, 5))
@@ -230,21 +183,24 @@ class UpdateWindow:
 
         # Создаем контейнер для двух колонок
         columns_frame = tk.Frame(main_frame, bg='#182030')
-        columns_frame.pack(fill=tk.BOTH, expand=True)
+        columns_frame.pack(fill=tk.X)
 
         # Левая колонка - Обновление менеджера (заглушка)
-        left_column = tk.Frame(columns_frame, bg='#182030', width=200, relief=tk.GROOVE, bd=0)
+        left_column = tk.Frame(columns_frame, bg='#182030', relief=tk.GROOVE, bd=0)
         left_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        left_column.pack_propagate(False)
+
 
         # Правая колонка - Обновление AdGuard VPN
-        right_column = tk.Frame(columns_frame, bg='#182030', width=200, relief=tk.GROOVE, bd=0)
+        right_column = tk.Frame(columns_frame, bg='#182030', relief=tk.GROOVE, bd=0)
         right_column.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
-        right_column.pack_propagate(False)
+
+
+        self.page.responsive_columns(columns_frame, (left_column, right_column), gap=24,
+                                     equal_width=False, fit_width=True)
 
         # === ЛЕВАЯ КОЛОНКА - ОБНОВЛЕНИЕ МЕНЕДЖЕРА ===
-        left_content = tk.Frame(left_column, bg='#182030', padx=5, pady=5)
-        left_content.pack(fill=tk.BOTH, expand=True)
+        left_content = tk.Frame(left_column, bg='#182030', padx=0, pady=0)
+        left_content.pack(fill=tk.X)
 
         tk.Label(left_content, text="AdGuard VPN Manager",
                 font=("Arial", 14, "bold"), fg='white', bg='#182030').pack(anchor=tk.CENTER, pady=(0, 10))
@@ -258,14 +214,14 @@ class UpdateWindow:
 
         # Кнопка проверки и обновления менеджера
         manager_buttons_frame = tk.Frame(left_content, bg='#182030')
-        manager_buttons_frame.pack(anchor=tk.CENTER, pady=(0, 18))
+        manager_buttons_frame.pack(anchor=tk.CENTER, pady=(0, 16))
 
         self.manager_action_button = create_hover_button(
             manager_buttons_frame,
             text="Проверить обновление",
             command=self.check_manager_update,
             bg='#15354D', fg='white', font=('Arial', 10),
-            width=20, bd=0, highlightthickness=0, padx=10, pady=5
+            width=0, bd=0, highlightthickness=0, padx=10, pady=5
         )
         self.manager_action_button.pack(side=tk.LEFT)
 
@@ -273,16 +229,35 @@ class UpdateWindow:
         log_frame = tk.Frame(left_content, bg='#182030')
         log_frame.pack(fill=tk.X, pady=(5, 0))
 
-        tk.Label(log_frame, text="Информация:",
-                font=("Arial", 10), fg='white', bg='#182030').pack(anchor=tk.W, pady=(0, 10))
+        log_header = tk.Frame(log_frame, bg='#182030')
+        log_header.pack(fill=tk.X, pady=(0, 10))
+        log_label = tk.Label(log_header, text="Информация:",
+                             font=("Arial", 10), fg='white', bg='#182030')
+        self.copy_log_button = create_hover_button(
+            log_header, text="Копировать", command=self.copy_log,
+            bg='#15354D', fg='white', font=('Arial', 9),
+            bd=0, highlightthickness=0, padx=8, pady=3)
+        self.page.responsive_row(log_header, (log_label, self.copy_log_button),
+                                 gap=8, align='left')
 
-        self.log_text = tk.Text(log_frame, height=5, bg='#15354D',
-                                highlightthickness=0,fg='white', wrap=tk.WORD, font=("Courier", 9))
-        self.log_text.pack(fill=tk.X)
+        log_body = tk.Frame(log_frame, bg='#182030')
+        log_body.pack(fill=tk.X)
+        self.log_text = tk.Text(log_body, height=5, width=40, bg='#15354D',
+                               highlightthickness=0, fg='white', wrap=tk.WORD,
+                               font=("Courier", 9), state=tk.DISABLED)
+        log_style = ttk.Style(self.root)
+        log_style.configure('Update.Vertical.TScrollbar', background='#2A4466',
+                            troughcolor='#0F1A2F', bordercolor='#182030', arrowcolor='white')
+        log_style.map('Update.Vertical.TScrollbar', background=[('active', '#3A5A88')])
+        self.log_scrollbar = ttk.Scrollbar(log_body, orient=tk.VERTICAL,
+                                          command=self.log_text.yview, style='Update.Vertical.TScrollbar')
+        self.log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=self.log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # === ПРАВАЯ КОЛОНКА - ОБНОВЛЕНИЕ ADGUARD VPN ===
-        right_content = tk.Frame(right_column, bg='#182030', padx=5, pady=5)
-        right_content.pack(fill=tk.BOTH, expand=True)
+        right_content = tk.Frame(right_column, bg='#182030', padx=0, pady=0)
+        right_content.pack(fill=tk.X)
 
         tk.Label(right_content, text="AdGuard VPN",
                 font=("Arial", 14, "bold"), fg='white', bg='#182030').pack(anchor=tk.CENTER, pady=(0, 10))
@@ -292,7 +267,7 @@ class UpdateWindow:
         version_frame.pack(fill=tk.X, pady=(0, 10))
 
         # Получаем текущую версию при инициализации
-        current_version = self.get_adguard_current_version()
+        current_version = "Загрузка…"
 
         self.current_version_label = tk.Label(version_frame,
                                             text=f"Версия: {current_version}",
@@ -301,13 +276,13 @@ class UpdateWindow:
 
         # Кнопка действия (проверка/обновление)
         buttons_frame = tk.Frame(right_content, bg='#182030')
-        buttons_frame.pack(fill=tk.X, pady=(0, 20))
+        buttons_frame.pack(fill=tk.X, pady=(0, 16))
 
 
         self.action_button = create_hover_button(buttons_frame, text="Проверить обновление",
                 command=self.check_adguard_update, bg='#15354D', fg='white', font=('Arial', 10),
-                width=20, bd=0, highlightthickness=0, padx=10, pady=5)
-        self.action_button.pack(anchor=tk.CENTER, padx=(0, 10))
+                width=0, bd=0, highlightthickness=0, padx=10, pady=5)
+        self.action_button.pack(anchor=tk.CENTER)
 
         # Выбор канала обновления
         channel_frame = tk.Frame(right_content, bg='#182030')
@@ -316,11 +291,18 @@ class UpdateWindow:
         # Изменяемая строка с текущим каналом
         self.channel_label = tk.Label(channel_frame, text="Канал обновления: Release",
                                     font=("Arial", 11), fg='#5BA06A', bg='#182030')
-        self.channel_label.pack(anchor=tk.CENTER, pady=(0, 8))
+        # Reserve the full caption even if an early WM allocation wraps it.
+        # Character units keep this minimum proportional to the actual font.
+        caption_width = int(self.root.tk.call('font', 'measure', self.channel_label['font'],
+                                              'Канал обновления: Release'))
+        digit_width = max(1, int(self.root.tk.call('font', 'measure', self.channel_label['font'], '0')))
+        self.channel_label.configure(width=ceil(caption_width / digit_width))
+        self.channel_label.pack(fill=tk.X, pady=(0, 8))
+        self.page.wrap(self.channel_label)
 
         # Фрейм для радиокнопок - на одной линии
         radio_frame = tk.Frame(channel_frame, bg='#182030')
-        radio_frame.pack(side=tk.LEFT, padx=20)
+        radio_frame.pack(fill=tk.X)
 
         self.channel_var = tk.StringVar(value="release")
 
@@ -340,6 +322,8 @@ class UpdateWindow:
                                         bd=0, highlightthickness=0)
         self.beta_radio.pack(side=tk.LEFT)
 
+        self.page.responsive_row(radio_frame, (self.release_radio, self.beta_radio), gap=16)
+
         # Кнопка действия (проверка/обновление)
         buttons_frame = tk.Frame(right_content, bg='#182030')
         buttons_frame.pack(anchor=tk.CENTER)
@@ -350,12 +334,15 @@ class UpdateWindow:
 
 
         # Кнопка закрытия
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=(8, 10))
 
         close_btn=create_hover_button(btn_frame, text="Закрыть", command=self.close_window,
                                       bg='#15354D', fg='white', font=('Arial', 10), width=15, bd=0, highlightthickness=0, padx=10, pady=5)
         close_btn.pack(anchor=tk.CENTER)
+
+        self.page.wrap(self.current_version_label)
+        self.page.request_fit()
 
     def update_manager_action_button(self):
         """Обновляет текст и команду кнопки действия менеджера в зависимости от наличия обновления"""
@@ -376,31 +363,22 @@ class UpdateWindow:
         """Проверяет обновления для менеджера"""
         self.manager_action_button.config(state=tk.DISABLED, text="Проверка...")
 
-        thread = threading.Thread(target=self._check_manager_update_thread)
-        thread.daemon = True
-        thread.start()
+        self.tasks.submit(self.manager_updater.check_for_updates,
+                          self._manager_checked, self._manager_check_error, key='manager')
 
-    def _check_manager_update_thread(self):
-        """Поток для проверки обновлений менеджера"""
-        try:
-            latest_version, release_data = self.manager_updater.check_for_updates()
+    def _manager_checked(self, values):
+        version, release = values
+        self.latest_manager_version, self.latest_release_data = version, release
+        self.manager_update_available = bool(version)
+        self.log_message(f"📢 Доступно обновление AdGuard VPN Manager: {version}" if version
+                         else "✅ Установлена последняя версия AdGuard VPN Manager")
+        self.manager_action_button.config(state=tk.NORMAL)
+        self.update_manager_action_button()
 
-            if latest_version:
-                self.latest_manager_version = latest_version
-                self.latest_release_data = release_data
-                self.manager_update_available = True
-
-                self.root.after(0, lambda: self.log_message(f"📢 Доступно обновление AdGuard VPN Manager: {latest_version}"))
-            else:
-                self.manager_update_available = False
-                self.root.after(0, lambda: self.log_message("✅ Установлена последняя версия AdGuard VPN Manager"))
-
-        except Exception as e:
-            self.manager_update_available = False
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка проверки обновлений AdGuard VPN Manager: {str(e)}"))
-        finally:
-            self.root.after(0, lambda: self.manager_action_button.config(state=tk.NORMAL))
-            self.root.after(0, self.update_manager_action_button)
+    def _manager_check_error(self, error):
+        self.log_message(f"❌ Ошибка проверки обновлений менеджера: {clean_output(str(error))}")
+        self.manager_action_button.config(state=tk.NORMAL)
+        self.update_manager_action_button()
 
     def download_manager_update(self):
         """Скачивает обновление менеджера"""
@@ -417,30 +395,30 @@ class UpdateWindow:
             return
 
         self.manager_action_button.config(state=tk.DISABLED, text="Обновление...")
+        release, version = dict(self.latest_release_data), self.latest_manager_version
 
-        thread = threading.Thread(target=self._download_manager_update_thread)
-        thread.daemon = True
-        thread.start()
+        self.tasks.submit(lambda: self._download_manager_update_thread(release, version), key='manager')
 
-    def _download_manager_update_thread(self):
+    def _download_manager_update_thread(self, release, version):
         """Поток для скачивания и установки обновления менеджера"""
         try:
-            download_url = self.manager_updater.get_download_url(self.latest_release_data)
+            download_url = self.manager_updater.get_download_url(release)
             if not download_url:
                 raise Exception("URL для скачивания не найден")
 
-            self.root.after(0, lambda: self.log_message("📥 Начало загрузки обновления AdGuard VPN Manager..."))
+            self.tasks.post( lambda: self.log_message("📥 Начало загрузки обновления AdGuard VPN Manager..."))
 
             # Создаем временный файл для загрузки
             temp_dir = tempfile.gettempdir()
-            filename = f"manager_update_{self.latest_manager_version}.tar.gz"
+            filename = f"manager_update_{version}.tar.gz"
             downloaded_file_path = os.path.join(temp_dir, filename)
 
             # Скачиваем файл с помощью urllib (стандартная библиотека)
             import urllib.request
-            urllib.request.urlretrieve(download_url, downloaded_file_path)
+            with urllib.request.urlopen(download_url, timeout=30) as response, open(downloaded_file_path, 'wb') as target:
+                shutil.copyfileobj(response, target)
 
-            self.root.after(0, lambda: self.log_message("✅ Архив скачан. Начинается установка..."))
+            self.tasks.post( lambda: self.log_message("✅ Архив скачан. Начинается установка..."))
 
             # Путь к папке менеджера
             manager_dir = os.path.expanduser("~/AdGuard VPN Manager")
@@ -448,7 +426,7 @@ class UpdateWindow:
             # Удаляем старую версию
             if os.path.exists(manager_dir):
                 shutil.rmtree(manager_dir)
-                self.root.after(0, lambda: self.log_message("🗑️ Старая версия удалена"))
+                self.tasks.post( lambda: self.log_message("🗑️ Старая версия удалена"))
 
             # Создаем папку заново
             os.makedirs(manager_dir, exist_ok=True)
@@ -457,26 +435,26 @@ class UpdateWindow:
             with tarfile.open(downloaded_file_path, 'r:gz') as tar_ref:
                 tar_ref.extractall(manager_dir)
 
-            self.root.after(0, lambda: self.log_message("✅ Файлы распакованы"))
+            self.tasks.post( lambda: self.log_message("✅ Файлы распакованы"))
 
             # Удаляем временный файл
             os.remove(downloaded_file_path)
 
-            self.root.after(0, lambda: self.log_message(f"✅ Обновление AdGuard VPN Manager до версии {self.latest_manager_version} завершено!"))
-            self.root.after(0, lambda: self.log_message("🔄 Перезапуск AdGuard VPN Manager..."))
+            self.tasks.post( lambda: self.log_message(f"✅ Обновление AdGuard VPN Manager до версии {version} завершено!"))
+            self.tasks.post( lambda: self.log_message("🔄 Перезапуск AdGuard VPN Manager..."))
 
             # После успешного обновления сбрасываем флаг
-            self.manager_update_available = False
+            self.tasks.post(setattr, self, "manager_update_available", False)
 
             # Перезапускаем менеджер через 2 секунды
-            self.root.after(2000, self.restart_manager)
+            self.tasks.post(lambda: self.root.after(2000, self.restart_manager))
 
         except Exception as error:
             error_msg = str(error)
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка установки обновления AdGuard VPN Manager: {error_msg}"))
+            self.tasks.post( lambda: self.log_message(f"❌ Ошибка установки обновления AdGuard VPN Manager: {error_msg}"))
         finally:
-            self.root.after(0, lambda: self.manager_action_button.config(state=tk.NORMAL))
-            self.root.after(0, self.update_manager_action_button)
+            self.tasks.post( lambda: self.manager_action_button.config(state=tk.NORMAL))
+            self.tasks.post( self.update_manager_action_button)
 
     def restart_manager(self):
         """Перезапускает менеджер"""
@@ -486,7 +464,7 @@ class UpdateWindow:
             main_script = os.path.join(manager_dir, "main.py")
 
             if not os.path.exists(main_script):
-                self.root.after(0, lambda: self.log_message("❌ Файл main.py не найден"))
+                self.tasks.post( lambda: self.log_message("❌ Файл main.py не найден"))
                 return
 
             # Закрываем текущие окна
@@ -501,265 +479,166 @@ class UpdateWindow:
             subprocess.Popen([sys.executable, main_script])
 
         except Exception as e:
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка при перезапуске: {str(e)}"))
+            self.tasks.post( lambda message=str(e): self.log_message(f"❌ Ошибка при перезапуске: {message}"))
 
     def update_adguard_version_display(self):
-        """Обновляет отображение текущей версии AdGuard VPN"""
-        current_version = self.get_adguard_current_version()
-        self.current_version_label.config(text=f"Версия: {current_version}")
+        generation = self._generation
+        self.tasks.submit(self.get_current_version,
+            lambda version: self.current_version_label.config(text=f"Версия: {version or 'Неизвестно'}")
+            if generation == self._generation else None, key='version')
+
+    def _begin_cli(self, text):
+        if self._cli_busy:
+            return False
+        self._cli_busy = True
+        self._generation += 1
+        self.action_button.config(state=tk.DISABLED, text=text)
+        return True
+
+    def _finish_cli(self, refresh=True):
+        self._cli_busy = False
+        self.action_button.config(state=tk.NORMAL)
+        self.update_action_button()
+        if refresh:
+            self.update_adguard_version_display()
+
+    def _cli_error(self, error):
+        self.log_message(f"❌ Ошибка команды: {clean_output(str(error))}")
+        self._finish_cli()
 
     def apply_update_channel(self):
-        """Применяет выбранный канал обновления"""
-        selected_channel = self.channel_var.get()
-
-        # Проверяем, не пытаемся ли установить уже активный канал
-        if selected_channel == self.update_channel:
-            self.log_message(f"Канал {selected_channel} уже установлен")
+        channel = self.channel_var.get()
+        if self._cli_busy:
             return
+        if channel == self.update_channel:
+            self.log_message(f"Канал {channel} уже установлен")
+            return
+        if not self._begin_cli("Установка канала…"):
+            return
+        self.tasks.submit(lambda: run_command(
+            ['adguardvpn-cli', 'config', 'set-update-channel', channel], timeout=10),
+            lambda result: self._channel_done(channel, result), self._cli_error, key='cli')
 
-        # Логируем выбор пользователя
-        self.log_message(f"🔄 Попытка установки канала: {selected_channel}")
-
-        thread = threading.Thread(target=self._apply_channel_thread, args=(selected_channel,))
-        thread.daemon = True
-        thread.start()
-
-    def _apply_channel_thread(self, channel):
-        """Поток для применения канала обновления"""
-        try:
-            self.root.after(0, lambda: self.log_message(f"⏳ Установка канала {channel}..."))
-
-            result = subprocess.run(
-                ['adguardvpn-cli', 'config', 'set-update-channel', channel],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                # Успешно применили - обновляем отображение
-                self.update_channel = channel
-                self.root.after(0, self.update_channel_display)
-                self.root.after(0, lambda: self.log_message(f"✅ Канал обновления успешно изменен на {channel}"))
-
-                # После смены канала сбрасываем статус обновления
-                self.update_available = False
-                self.available_version = None
-                self.root.after(0, self.update_action_button)
-
-            else:
-                error_msg = result.stderr if result.stderr else "Неизвестная ошибка"
-                self.root.after(0, lambda: self.log_message(f"❌ Ошибка установки канала: {error_msg}"))
-
-        except subprocess.TimeoutExpired:
-            self.root.after(0, lambda: self.log_message("❌ Таймаут при установке канала"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка при установке канала: {str(e)}"))
+    def _channel_done(self, channel, result):
+        self.log_message(format_result(result, channel))
+        if result.returncode == 0 and not result.timed_out and not has_error(result.output):
+            self.update_channel = channel
+            self.update_channel_display()
+            self.update_available = False
+            self.available_version = None
+            self.log_message(f"✅ Канал изменён на {channel}")
+        else:
+            self.log_message("❌ Канал не изменён.\n" + diagnostics(result))
+        self._finish_cli()
 
     def check_adguard_update(self):
-        """Проверяет обновления AdGuard VPN"""
-        # Временно блокируем кнопку во время проверки
-        self.action_button.config(state=tk.DISABLED, text="Проверка...")
+        if not self._begin_cli("Проверка…"):
+            return
+        self.tasks.submit(lambda: run_command(['adguardvpn-cli', 'check-update'], timeout=15),
+                          self._check_done, self._cli_error, key='cli')
 
-        thread = threading.Thread(target=self._check_update_thread)
-        thread.daemon = True
-        thread.start()
-
-    def _check_update_thread(self):
-        """Поток для проверки обновлений"""
-        try:
-            self.root.after(0, lambda: self.log_message("🔍 Проверка обновлений AdGuard VPN..."))
-
-            result = subprocess.run(
-                ['adguardvpn-cli', 'check-update'],
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
-
-            # Очищаем вывод от ANSI кодов
-            cleaned_output = self.clean_ansi_codes(result.stdout + result.stderr)
-
-            # Анализируем вывод более точно
-            output_lower = cleaned_output.lower()
-
-            # Пытаемся извлечь версию обновления
-            version = self.extract_version(cleaned_output)
-
-            # Проверяем наличие сообщения о доступном обновления
-            has_update_available = any(phrase in output_lower for phrase in [
-                'is now available',
-                'update available',
-                'available',
-                'доступно',
-                'можно обновиться',
-                'new version'
-            ])
-
-            # Проверяем наличие сообщения о том, что версия актуальна
-            is_latest = any(phrase in output_lower for phrase in [
-                'latest version',
-                'up to date',
-                'актуальна',
-                'you are using the latest'
-            ])
-
-            if has_update_available:
-                self.update_available = True
-                self.available_version = version
-                if version:
-                    self.root.after(0, lambda: self.log_message(f"📢 Доступно обновление AdGuard VPN {version}"))
-                else:
-                    self.root.after(0, lambda: self.log_message("📢 Доступно обновление AdGuard VPN"))
-
-            elif is_latest:
-                # Получаем текущую версию
-                current_version = self.get_adguard_current_version()
-                self.root.after(0, lambda: self.log_message(f"✅ Установлена последняя версия AdGuard VPN v{current_version}"))
-                self.update_available = False
-                self.available_version = None
-                # Возвращаем обычный вид
-                self.root.after(0, lambda: self.current_version_label.config(
-                    text=f"Версия: {current_version}",
-                    fg='#5BA06A'  # Зеленый цвет для актуальной версии
-                ))
-
-            else:
-                # Если не можем определить статус, выводим как есть
-                self.root.after(0, lambda: self.log_message("⚠️ Не удалось определить статус обновления"))
-                self.update_available = False
-                self.available_version = None
-                # Возвращаем обычный вид
-                self.root.after(0, self.update_adguard_version_display)
-
-        except subprocess.TimeoutExpired:
-            self.root.after(0, lambda: self.log_message("❌ Таймаут при проверке обновлений"))
-            self.update_available = False  # Добавлена эта строка
-            self.available_version = None  # Добавлена эта строка
-        except Exception as e:
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка при проверке обновлений: {str(e)}"))
-            self.update_available = False  # Добавлена эта строка
-            self.available_version = None  # Добавлена эта строка
-        finally:
-            # Всегда разблокируем кнопку и обновляем ее текст
-            self.root.after(0, lambda: self.action_button.config(state=tk.NORMAL))
-            self.root.after(0, self.update_action_button)
+    def _check_done(self, result):
+        self.log_message(format_result(result, self.update_channel))
+        status = check_status(result)
+        if status == 'available':
+            self.update_available = True
+            self.available_version = self.extract_version(result.output)
+            self.log_message(f"📢 Доступно обновление AdGuard VPN {self.available_version or ''}")
+        elif status == 'latest':
+            self.update_available = False
+            self.available_version = None
+            self.log_message("✅ Установлена последняя версия AdGuard VPN")
+        else:
+            self.log_message("❌ Проверка не определила актуальность версии.\n" + diagnostics(result))
+        self._finish_cli()
 
     def get_current_version(self):
-        """Получает текущую версию AdGuard VPN через adguardvpn-cli -v"""
         try:
-            result = subprocess.run(
-                ['adguardvpn-cli', '-v'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                # Очищаем вывод от ANSI кодов и лишних символов
-                version_output = self.clean_ansi_codes(result.stdout).strip()
-
-                # Ищем версию в формате vX.X.X или X.X.X
-                version_match = re.search(r'v?(\d+\.\d+\.\d+)', version_output)
-                if version_match:
-                    return f"{version_match.group(1)}"
-
-                # Если не нашли через regex, возвращаем как есть (очищенное)
-                return version_output if version_output else None
-
-            return None
-        except Exception:
+            result = run_command(['adguardvpn-cli', '-v'], timeout=5)
+            return self.extract_version(result.output) if result.returncode == 0 and not result.timed_out and not has_error(result.output) else None
+        except (OSError, subprocess.SubprocessError):
             return None
 
     def extract_version(self, text):
-        """Извлекает версию из текста вывода"""
-        try:
-            # Ищем паттерны версий: v1.5.12, 1.5.12, v2.0.1 и т.д.
-            version_patterns = [
-                r'AdGuard VPN[^\n]*v?(\d+\.\d+\.\d+)[^\n]*is now available',
-                r'v?(\d+\.\d+\.\d+)[^\n]*is now available',
-                r'version[^\n]*v?(\d+\.\d+\.\d+)',
-                r'v?(\d+\.\d+\.\d+)[^\n]*available',
-                r'обновление[^\n]*v?(\d+\.\d+\.\d+)'
-            ]
-
-            for pattern in version_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    return f"v{match.group(1)}" if not match.group(1).startswith('v') else match.group(1)
-
-            return None
-        except Exception:
-            return None
+        match = re.search(r'(?<![\d.])(\d+\.\d+\.\d+)(?:[-+][\w.]+)?', text)
+        return match.group(0) if match else None
 
     def update_adguard(self):
-        """Запускает обновление AdGuard VPN"""
-        if show_question_dialog(self.root, "Обновление",
-                               "Вы уверены, что хотите обновиться?\n\n"
-                               "Если VPN подключен, соединение будет разорвано."):
+        if self._cli_busy:
+            return
+        if not show_question_dialog(self.root, "Обновление",
+                "Вы уверены, что хотите обновиться?\n\n"
+                "Если VPN подключен, CLI может отключить его до скачивания архива. При ошибке обновления VPN может остаться отключённым."):
+            return
+        if not self._begin_cli("Обновление…"):
+            return
+        channel = self.update_channel
+        self.tasks.submit(self._update_work,
+            lambda values: self._update_done(channel, values), self._cli_error, key='cli')
 
-            # Блокируем кнопку во время обновления
-            self.action_button.config(state=tk.DISABLED, text="Обновление...")
+    def _update_work(self):
+        before = self.get_current_version()
+        result = run_command(['adguardvpn-cli', 'update'], timeout=60, input='y\n')
+        after = self.get_current_version()
+        return result, before, after
 
-            thread = threading.Thread(target=self._update_thread)
-            thread.daemon = True
-            thread.start()
-
-    def _update_thread(self):
-        """Поток для выполнения обновления"""
-        try:
-            self.root.after(0, lambda: self.log_message("🔄 Запуск обновления AdGuard VPN..."))
-
-            # Запускаем процесс обновления с автоматическим ответом 'y'
-            process = subprocess.Popen(
-                ['adguardvpn-cli', 'update'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            # Автоматически отвечаем 'y' на запрос подтверждения
-            output, error = process.communicate(input='y\n', timeout=60)
-
-            # Очищаем вывод от ANSI кодов
-            cleaned_output = self.clean_ansi_codes(output + error)
-
-            if process.returncode == 0:
-                self.root.after(0, lambda: self.log_message("✅ AdGuard VPN успешно обновлен!"))
-                # После успешного обновления сбрасываем флаг
-                self.update_available = False
-                self.available_version = None
-
-                # ОБНОВЛЯЕМ ОТОБРАЖЕНИЕ ВЕРСИИ ПОСЛЕ ОБНОВЛЕНИЯ
-                self.root.after(0, self.update_adguard_version_display)
-
-                # Также обновляем текст кнопки
-                self.root.after(0, self.update_action_button)
-            else:
-                self.root.after(0, lambda: self.log_message(f"❌ Ошибка при обновлении:\n{cleaned_output}"))
-
-        except subprocess.TimeoutExpired:
-            self.root.after(0, lambda: self.log_message("❌ Таймаут при выполнении обновления"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log_message(f"❌ Ошибка при обновлении: {str(e)}"))
-        finally:
-            # Всегда разблокируем кнопку и обновляем ее текст
-            self.root.after(0, lambda: self.action_button.config(state=tk.NORMAL))
-            self.root.after(0, self.update_action_button)
+    def _update_done(self, channel, values):
+        result, before, after = values
+        self.log_message(format_result(result, channel, before, after))
+        if update_succeeded(result, before, after):
+            offered = self.available_version
+            self.update_available = False
+            self.available_version = None
+            self.log_message(f"✅ Установлена версия {after} (до обновления: {before}).")
+            if offered and self.extract_version(offered) != after:
+                self.log_message(f"При проверке предлагалась {offered}; фактически установлена {after}.")
+        else:
+            self.update_available = True
+            self.log_message("❌ Успешное обновление не подтверждено.\n" + diagnostics(result))
+            self.log_message(self._update_failure_summary(result, before, after))
+        self._finish_cli(refresh=False)
+        self.current_version_label.config(text=f"Версия: {after or 'Неизвестно'}")
 
     def clean_ansi_codes(self, text):
-        """Очищает текст от ANSI escape sequences"""
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_escape.sub('', text)
+        return clean_output(text)
+
+    @staticmethod
+    def _update_failure_summary(result, before, after):
+        output = result.output.lower()
+        if result.timed_out or re.search(r'timed? ?out|timeout', output):
+            reason = 'истекло время ожидания'
+        elif re.search(r'could not resolve|couldn.t resolve|name resolution|\bdns\b', output):
+            reason = 'ошибка DNS'
+        elif re.search(r'certificate|\bssl\b|\btls\b', output):
+            reason = 'ошибка TLS/сертификата'
+        elif re.search(r'\bhttp[^\n]*[45]\d\d|error: [45]\d\d', output):
+            reason = 'ошибка HTTP'
+        elif re.search(r'permission|denied|operation not permitted', output):
+            reason = 'недостаточно прав'
+        elif 'download' in output:
+            reason = 'не удалось скачать архив'
+        else:
+            reason = 'результат не подтверждён'
+        version = (f'Версия не изменилась: {after}.' if before and after and before == after
+                   else f'Версия: {before or "неизвестно"} → {after or "неизвестно"}.')
+        return f'❌ {reason[0].upper() + reason[1:]}.\n{version}\nМожно повторить обновление.'
+
+    def copy_log(self):
+        text = clean_output(self.log_text.get('1.0', 'end-1c'))
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
 
     def log_message(self, message):
-        """Добавляет сообщение в лог"""
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.root.update()
+        """Append cleaned diagnostics while keeping the journal read-only."""
+        self.log_text.configure(state=tk.NORMAL)
+        try:
+            self.log_text.insert(tk.END, clean_output(str(message)) + "\n")
+            self.log_text.see(tk.END)
+        finally:
+            self.log_text.configure(state=tk.DISABLED)
 
     def close_window(self):
+        self.tasks.close()
         self.root.destroy()
 
     def run(self):

@@ -1,9 +1,13 @@
+from core.ui_tasks import TaskRunner
+from utils.browser import open_url
+from core.ui_scaling import place_popup, observe_window, snapshot
+from types import SimpleNamespace
+from math import gcd
 import tkinter as tk
 from tkinter import ttk, scrolledtext, PhotoImage
 import subprocess
 import threading
 import time
-import webbrowser
 import sys
 import re
 from datetime import datetime, date
@@ -86,14 +90,24 @@ def check_site_availability_improved(url):
         return False
 
 class AdGuardVPNManager:
-    def __init__(self, root):
+    def __init__(self, root, initial_license=None):
         self.root = root
+        self.tasks = TaskRunner(root)
+        self._main_thread = threading.get_ident()
+        self._closed = False
+        self._refresh_generation = 0
+        self._license_text = ""
+        self._license_partial = False
+        self._auth_known = False
+        self._auth_error = False
+        self._last_license_refresh = float("-inf")
+        self._status_timer = None
         self.setup_window_properties()
         self.root.title("AdGuard VPN Manager")
         self.window_height_hidden = 210  # Высота когда лог скрыт
         self.window_height_visible = 355  # Высота когда лог показан
         self.window_width = 570
-        self.root.geometry(f"{self.window_width}x{self.window_height_hidden}")
+        self.root.geometry("570x210")
         self.root.configure(bg='#182030')
 
 
@@ -109,7 +123,7 @@ class AdGuardVPNManager:
         self.is_connected = False
 
         self.is_logged_in = False
-        self.check_initial_login_status()  # Проверяем статус при запуске
+
 
         # Флаг для отслеживания состояния выпадающего меню
         self.account_menu_open = False
@@ -118,8 +132,14 @@ class AdGuardVPNManager:
         # Bind событий фокус
         self.root.bind("<FocusIn>", self.on_focus_in)
         self.root.bind("<FocusOut>", self.on_focus_out)
+        self.root.bind("<Destroy>", self._cancel_menu_focus_check, add="+")
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
         self.setup_gui()
+        if initial_license is not None:
+            self._apply_refresh(self._refresh_generation, {'license': initial_license})
+            self._last_license_refresh = time.monotonic()
         self.update_status()
         self.update_ui_for_auth_status()
         self.schedule_status_update()
@@ -152,38 +172,48 @@ class AdGuardVPNManager:
         pass  # Можно добавить логику при необходимости
 
     def on_focus_out(self, event):
-        """Обрабатывает потерю фокуса окном - закрываем меню"""
+        """Debounce X focus handoffs between the owner and its popup windows."""
+        pending = getattr(self, '_menu_focus_after', None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+        self._menu_focus_after = self.root.after(80, self._close_menus_if_unfocused)
+
+    def _close_menus_if_unfocused(self):
+        self._menu_focus_after = None
+        focused = self.root.focus_get()
+        if focused is not None:
+            owner = focused.winfo_toplevel()
+            if owner in (self.root, getattr(self, 'account_menu', None), getattr(self, 'settings_menu', None)):
+                return
         self.close_all_menus()
 
+    def _cancel_menu_focus_check(self, event):
+        if event.widget is self.root and getattr(self, '_menu_focus_after', None):
+            self.root.after_cancel(self._menu_focus_after)
+            self._menu_focus_after = None
+
     def check_initial_login_status(self):
-        """Синхронно проверяет статус авторизации при запуске"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'list-locations'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            self.is_logged_in = (result.returncode == 0)
-        except:
-            self.is_logged_in = False
+        return self.refresh_state()
 
     def setup_gui(self):
         # Основной контейнер
-        main_container = tk.Frame(self.root, bg='#182030')
+        self.main_container = main_container = tk.Frame(self.root, bg='#182030', padx=20, pady=14)
         main_container.pack(fill=tk.BOTH, expand=True)
+        self.page = SimpleNamespace(body=main_container, footer=main_container)
 
         # Верхняя панель с логотипом и статусом
-        header_frame = tk.Frame(main_container, bg='#182030', height=100)
-        header_frame.pack(fill=tk.X, padx=20, pady=10)
-        header_frame.pack_propagate(False)
+        header_frame = tk.Frame(main_container, bg='#182030')
+        header_frame.pack(fill=tk.X)
 
         # Верхняя строка: логотип + иконки
         top_row_frame = tk.Frame(header_frame, bg='#182030')
-        top_row_frame.pack(fill=tk.X, pady=(5, 0))
+        top_row_frame.pack(fill=tk.X)
+        self.top_row_frame = top_row_frame
+        top_row_frame.grid_columnconfigure(0, weight=1)
 
         left_icons_frame = tk.Frame(top_row_frame, bg='#182030')
-        left_icons_frame.pack(side=tk.LEFT, fill=tk.Y)
+        left_icons_frame.grid(row=0, column=0, sticky="ew")
+        self.account_frame = left_icons_frame
 
         # Иконка личного кабинета
         self.account_icon = tk.Label(left_icons_frame, text="👤", font=("Arial", 16),
@@ -195,19 +225,26 @@ class AdGuardVPNManager:
         create_tooltip(self.account_icon, "Личный кабинет")
 
         # Email пользователя (рядом с иконкой)
-        self.email_label = tk.Label(left_icons_frame, text="",
-                            font=("Arial", 11), fg='#8e8e93', bg='#182030', justify='left')
-        self.email_label.pack(side=tk.LEFT, padx=(0, 15))
+        self.account_text_frame = tk.Frame(left_icons_frame, bg='#182030')
+        self.account_text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.email_label = tk.Label(self.account_text_frame, text="",
+                            font=("Arial", 11), fg='#8e8e93', bg='#182030',
+                            justify=tk.LEFT, anchor=tk.W)
+        self.email_label.pack(fill=tk.X)
+        self.account_status_label = tk.Label(self.account_text_frame, text="",
+                            font=("Arial", 10), fg='#8e8e93', bg='#182030',
+                            justify=tk.LEFT, anchor=tk.W)
 
         self.update_email_display()
 
         # Логотип и заголовок по центру
         logo_container = tk.Frame(header_frame, bg='#182030')
-        logo_container.pack(expand=True, fill=tk.BOTH)
+        logo_container.pack(fill=tk.X, pady=(10, 16))
 
         # Центрирующий фрейм
         center_frame = tk.Frame(logo_container, bg='#182030')
-        center_frame.pack(expand=True)
+        center_frame.pack()
+        self.title_frame = center_frame
 
         try:
             # Загрузка изображения
@@ -216,6 +253,8 @@ class AdGuardVPNManager:
             self.logo_image = tk.PhotoImage(file=logo_path)
             logo_icon = tk.Label(center_frame, image=self.logo_image, bg='#182030')
             logo_icon.pack(side=tk.LEFT, padx=(0, 10))
+            self.logo_icon = logo_icon
+            self.logo_original = self.logo_image
 
         except Exception as e:
             print(f"Не удалось загрузить логотип: {e}")
@@ -230,7 +269,8 @@ class AdGuardVPNManager:
 
         # Иконки справа
         icons_frame = tk.Frame(top_row_frame, bg='#182030')
-        icons_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        icons_frame.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.toolbar_frame = icons_frame
 
         # Статус подключения
         self.status_label = tk.Label(icons_frame, text="🔴", font=("Arial", 12),
@@ -281,43 +321,54 @@ class AdGuardVPNManager:
 
         # Основная область контента
         content_frame = tk.Frame(main_container, bg='#182030')
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        content_frame.pack(fill=tk.BOTH, expand=True)
 
         # Кнопки
         btn_frame = tk.Frame(content_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame.pack(pady=(0, 0))
+        self.action_frame = btn_frame
 
         self.connect_button = tk.Button(btn_frame, text="Подключиться",
-                                        command=self.connect_vpn, font=('Arial', 11), bg='#5BA06A', fg='white', bd=0, padx=12, pady=12, width=17, anchor='center',
+                                        command=self.connect_vpn, font=('Arial', 11), bg='#5BA06A', fg='white', bd=0, padx=12, pady=12, width=18, anchor='center',
                                         highlightthickness=0, cursor='hand2',
                                         activebackground='#5BA06A', activeforeground='white', takefocus=0)
-        self.connect_button.grid(row=0, column=1, padx=(0, 10))
+        self.connect_button.grid(row=0, column=0, sticky="ew")
 
 
-        location_button = create_hover_button_for_manager(btn_frame, "Выбрать локацию", self.select_location)
-        location_button.grid(row=0, column=2)
+        self.location_button = location_button = create_hover_button_for_manager(btn_frame, "Выбрать локацию", self.select_location)
+        location_button.grid(row=0, column=2, sticky="ew")
 
-        # Центрируем весь фрейм с кнопками
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
-        btn_frame.grid_columnconfigure(2, weight=1)
-        btn_frame.grid_columnconfigure(3, weight=1)
+        btn_frame.grid_columnconfigure(0, weight=1, uniform="actions")
+        btn_frame.grid_columnconfigure(1, minsize=12)
+        btn_frame.grid_columnconfigure(2, weight=1, uniform="actions")
 
         # Фрейм для лога (изначально скрыт)
-        self.log_frame = tk.Frame(content_frame, bg='#182030', height=140)
-        self.log_frame.pack(fill=tk.X, pady=(0, 0), expand=False)
-        self.log_frame.pack_propagate(False)
+        self.log_frame = tk.Frame(content_frame, bg='#182030')
+        self.log_frame.pack(fill=tk.BOTH, pady=(14, 0), expand=True)
 
         tk.Label(self.log_frame, text="Логи:",
                 font=("Arial", 11), fg='white', bg='#182030').pack(anchor=tk.W, pady=(0, 5))
 
-        self.log_text = tk.Text(self.log_frame, bg='#15354D', highlightthickness=0, wrap=tk.WORD,
+        self.log_text = tk.Text(self.log_frame, height=7, width=1, bg='#15354D', highlightthickness=0, wrap=tk.WORD,
                             fg='#00ff00', font=("Courier", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        log_scrollbar = ttk.Scrollbar(self.log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.log_text.config(state=tk.DISABLED)
+
+        self.log_visible = False
+        self.page.observer = observe_window(self.root, (570, 210),
+                                            layout=self._layout_main, measure=self._measure_main)
+        self.page.request_fit = self.page.observer.refit
 
     def log_message(self, message):
         """Добавление сообщения в лог"""
+        if threading.get_ident() != self._main_thread:
+            self.tasks.post(self.log_message, message)
+            return
+        if self._closed:
+            return
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, f"{message}\n")
         self.log_text.see(tk.END)
@@ -332,24 +383,93 @@ class AdGuardVPNManager:
 
     def show_log(self):
         """Показывает лог"""
-        self.log_frame.pack(fill=tk.X, pady=(0, 5))
+        self.log_frame.pack(fill=tk.BOTH, pady=(14, 0), expand=True)
         self.eye_icon.config(text="🚫")
         self.log_visible = True
         create_tooltip(self.eye_icon, "Скрыть лог")
-        self.log_text.see(tk.END)
-
-        # Увеличиваем высоту окна
-        self.root.geometry(f"{self.window_width}x{self.window_height_visible}")
+        self.page.observer.refit()
 
     def hide_log(self):
-        """Скрывает лог"""
+        """Скрывает лог, сохраняя его содержимое и положение окна."""
         self.log_frame.pack_forget()
         self.eye_icon.config(text="📝")
         self.log_visible = False
         create_tooltip(self.eye_icon, "Показать лог")
+        self.page.observer.refit()
 
-        # Уменьшаем высоту окна
-        self.root.geometry(f"{self.window_width}x{self.window_height_hidden}")
+    def _layout_main(self, width=None):
+        width = self.root.winfo_width() if width is None else width
+        scale = snapshot(self.root)[4]
+        self.main_container.configure(padx=round(20 * scale), pady=round(14 * scale))
+        if hasattr(self, 'logo_original'):
+            factor = max(1, round(scale * 100))
+            if getattr(self, '_logo_scale', None) != factor:
+                divisor = gcd(factor, 100)
+                self.logo_image = self.logo_original.zoom(factor // divisor).subsample(100 // divisor)
+                self.logo_icon.configure(image=self.logo_image)
+                self._logo_scale = factor
+        available_actions = max(1, width - round(40 * scale))
+        needed_actions = self.connect_button.winfo_reqwidth() + self.location_button.winfo_reqwidth() + 12
+        narrow = needed_actions > available_actions
+        if getattr(self, '_actions_narrow', None) != narrow:
+            self.connect_button.grid_configure(row=0, column=0, padx=0,
+                                               pady=(0, 10) if narrow else 0)
+            self.location_button.grid_configure(row=1 if narrow else 0, column=0 if narrow else 2)
+            self.action_frame.grid_columnconfigure(1, minsize=0 if narrow else 12)
+            self.action_frame.grid_columnconfigure(2, weight=0 if narrow else 1, uniform="" if narrow else "actions")
+            self._actions_narrow = narrow
+        # Account text gets the width actually left after its icon, margins and
+        # toolbar. A long login takes priority over keeping the toolbar inline.
+        inner_width = max(1, width - 2 * int(self.main_container.cget('padx')))
+        icon_width = self.account_icon.winfo_reqwidth() + 15
+        inline_width = inner_width - self.toolbar_frame.winfo_reqwidth() - 12 - icon_width
+        login_width = self._login_text_width()
+        stacked = login_width > inline_width
+        if getattr(self, '_account_stacked', None) != stacked:
+            self.account_frame.grid_configure(row=0, column=0, columnspan=2 if stacked else 1,
+                                              sticky='ew')
+            self.toolbar_frame.grid_configure(row=1 if stacked else 0,
+                                               column=0 if stacked else 1,
+                                               columnspan=2 if stacked else 1,
+                                               padx=0 if stacked else (12, 0),
+                                               pady=(8, 0) if stacked else 0)
+            self._account_stacked = stacked
+        text_width = max(1, (inner_width - icon_width) if stacked else inline_width)
+        for label in (self.email_label, self.account_status_label):
+            insets = 2 * (label.winfo_pixels(label.cget('padx'))
+                          + label.winfo_pixels(label.cget('borderwidth'))
+                          + label.winfo_pixels(label.cget('highlightthickness')))
+            label.configure(wraplength=max(1, text_width - insets))
+        minimum_width = max(self.toolbar_frame.winfo_reqwidth(), self.title_frame.winfo_reqwidth(),
+                            self.connect_button.winfo_reqwidth(), self.location_button.winfo_reqwidth())
+        # Wrapping the login or moving the toolbar adds height during an ordinary
+        # user resize too. Keep the actions visible without resetting that width.
+        self.main_container.update_idletasks()
+        minimum_height = min(max(1, self.root.winfo_screenheight()-48),
+                             self.main_container.winfo_reqheight())
+        self.root.minsize(min(self.root.winfo_screenwidth()-16, minimum_width+round(40*scale)),
+                          minimum_height)
+
+    def _login_text_width(self):
+        text = self.email_label.cget('text')
+        width = max((int(self.root.tk.call('font', 'measure', self.email_label.cget('font'), line))
+                     for line in text.splitlines()), default=0)
+        return width + 2 * (self.email_label.winfo_pixels(self.email_label.cget('padx'))
+                            + self.email_label.winfo_pixels(self.email_label.cget('borderwidth'))
+                            + self.email_label.winfo_pixels(self.email_label.cget('highlightthickness')))
+
+    def _measure_main(self, scale):
+        self._layout_main(max(round(570 * scale), self.root.winfo_width()))
+        self.root.update_idletasks()
+        toolbar = self.toolbar_frame.winfo_reqwidth()
+        account = self.account_icon.winfo_reqwidth() + 15 + self._login_text_width()
+        header_width = toolbar + 12 + account + round(40 * scale)
+        width = max(round(570 * scale), min(header_width, self.root.winfo_screenwidth()-16),
+                    self.title_frame.winfo_reqwidth() + round(40 * scale),
+                    self.action_frame.winfo_reqwidth() + round(40 * scale))
+        self._layout_main(min(width, self.root.winfo_screenwidth() - 16))
+        self.root.update_idletasks()
+        return width, self.main_container.winfo_reqheight()
 
     def update_login_button(self):
         """Обновляет текст и цвет кнопки входа/выхода"""
@@ -390,7 +510,7 @@ class AdGuardVPNManager:
             # Для неавторизованных: только вход
             menu_height = 40
 
-        self.account_menu.geometry(f"165x{menu_height}+{menu_x}+{menu_y}")
+
         self.account_menu.configure(bg='#15354D', relief=tk.RAISED, bd=1)
 
         # Стиль для кнопок меню
@@ -403,7 +523,7 @@ class AdGuardVPNManager:
             'padx': 12,
             'pady': 10,
             'anchor': tk.W,
-            'width': 15,
+            'width': 0,
             'highlightthickness':0,
             'cursor': 'hand2'
         }
@@ -471,8 +591,11 @@ class AdGuardVPNManager:
         self.menu_auth_button.bind("<Enter>", lambda e: self.menu_auth_button.config(bg='#1e4a6a'))
         self.menu_auth_button.bind("<Leave>", lambda e: self.menu_auth_button.config(bg='#15354D'))
 
+        place_popup(self.account_menu, menu_x, menu_y)
+        self.account_menu.focus_force()
+
         # Bind событие клика вне меню для закрытия
-        self.account_menu.bind("<FocusOut>", lambda e: self.close_account_menu())
+        self.account_menu.bind("<FocusOut>", self.on_focus_out)
         self.root.bind("<Button-1>", self.check_close_account_menu)
 
     def close_account_menu(self):
@@ -516,28 +639,19 @@ class AdGuardVPNManager:
             return False
 
     def handle_menu_auth(self):
-        """Обрабатывает авторизацию/выход из меню"""
         self.close_account_menu()
-        if self.is_logged_in:
-            self.logout()
-        else:
-            thread = threading.Thread(target=self._login_thread)
-            thread.daemon = True
-            thread.start()
+        self.toggle_auth()
 
     def renew_license(self):
-        """Открывает страницу покупки/продления лицензии"""
         self.close_account_menu()
-        license_type = self.get_license_type() if self.is_logged_in else "Free"
+        self.tasks.submit(lambda: open_url(get_available_site()),
+                          self._browser_result, self._browser_error, key='browser')
 
-        if license_type == "Free":
-            action_text = "покупки лицензии"
-        else:
-            action_text = "продления лицензии"
+    def _browser_result(self, opened):
+        self.log_message('🔗 Страница открыта' if opened else '❌ Не удалось открыть браузер')
 
-        available_site = get_available_site()
-        webbrowser.open(available_site)
-        self.log_message(f"🔗 Открыта страница {action_text}")
+    def _browser_error(self, error):
+        self.log_message(f'❌ Не удалось открыть браузер: {error}')
 
     def toggle_settings_menu(self, event=None):
         """Открывает/закрывает меню настроек"""
@@ -563,7 +677,7 @@ class AdGuardVPNManager:
 
         self.settings_menu = tk.Toplevel(self.root)
         self.settings_menu.wm_overrideredirect(True)
-        self.settings_menu.geometry(f"180x135+{menu_x}+{menu_y}")
+
         self.settings_menu.configure(bg='#15354D', relief=tk.RAISED, bd=1)
 
         # Стиль для кнопок меню
@@ -576,7 +690,7 @@ class AdGuardVPNManager:
             'padx': 12,
             'pady': 10,
             'anchor': tk.W,
-            'width': 15,
+            'width': 0,
             'highlightthickness':0,
             'cursor': 'hand2'
         }
@@ -610,8 +724,11 @@ class AdGuardVPNManager:
         uninstall_button.bind("<Enter>", lambda e: uninstall_button.config(bg='#1e4a6a'))
         uninstall_button.bind("<Leave>", lambda e: uninstall_button.config(bg='#15354D'))
 
+        place_popup(self.settings_menu, menu_x, menu_y)
+        self.settings_menu.focus_force()
+
         # Bind событие клика вне меню для закрытия
-        self.settings_menu.bind("<FocusOut>", lambda e: self.close_settings_menu())
+        self.settings_menu.bind("<FocusOut>", self.on_focus_out)
         self.root.bind("<Button-1>", self.check_close_settings_menu)
 
     def close_settings_menu(self):
@@ -668,7 +785,8 @@ class AdGuardVPNManager:
 
     def open_info_link(self, event=None):
         """Открывает ссылку на справку AdGuard VPN"""
-        webbrowser.open("https://adguard-vpn.com/kb/ru/")
+        self.tasks.submit(lambda: open_url("https://adguard-vpn.com/kb/ru/"),
+                          self._browser_result, self._browser_error, key="browser")
         self.log_message("🛈︎ Открыта справка AdGuard VPN")
 
     def open_donate_link(self, event=None):
@@ -682,68 +800,68 @@ class AdGuardVPNManager:
         settings_window.run()
 
     def update_status(self):
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'status'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+        if threading.get_ident() != self._main_thread:
+            return self.tasks.post(self.update_status)
+        return self.refresh_state(include_license=False)
 
-            if result.returncode == 0:
-                ansi_escape = re.compile(r'\x1B\[[0-9;]*m')
-                clean_text = ansi_escape.sub('', result.stdout)
+    def refresh_state(self, include_license=True):
+        if self._closed or getattr(self, "_logout_pending", False):
+            return False
+        generation = self._refresh_generation
+        include_license = include_license or time.monotonic() - self._last_license_refresh >= 30
+        def work():
+            values = {}
+            for command in (('status', 'license') if include_license else ('status',)):
+                try:
+                    values[command] = subprocess.run(['adguardvpn-cli', command],
+                        capture_output=True, text=True, timeout=10)
+                except Exception as error:
+                    values[command] = error
+            return values
+        accepted = self.tasks.submit(work, lambda values: self._apply_refresh(generation, values),
+                                     key='refresh')
+        if accepted and include_license:
+            self._last_license_refresh = time.monotonic()
+        return accepted
 
-                is_connected = check_if_connected(clean_text)
-
-                if is_connected:
-                    location = clean_location_output(clean_text)
-                    if location:
-                        self.current_location = location
-                        self.status_label.config(text="🟢")
-                        self.connect_button.config(text="Отключиться", bg='#ff3b30',
-                                                activebackground='#ff3b30')  # Тот же цвет при нажатии
-                        self.is_connected = True
-                    else:
-                        self.current_location = "Подключено"
-                        self.status_label.config(text="🟢")
-                        self.connect_button.config(text="Отключиться", bg='#ff3b30',
-                                                activebackground='#ff3b30')  # Тот же цвет при нажатии
-                        self.is_connected = True
-                else:
-                    self.current_location = ""
-                    self.status_label.config(text="🔴")
-                    self.connect_button.config(text="Подключиться", bg='#5BA06A',
-                                            activebackground='#5BA06A')  # Тот же цвет при нажатии
-                    self.is_connected = False
-            else:
-                self.current_location = ""
-                self.status_label.config(text="🔴")
-                self.connect_button.config(text="Подключиться", bg='#5BA06A',
-                                        activebackground='#5BA06A')  # Тот же цвет при нажатии
-                self.is_connected = False
-        except Exception as e:
-            self.current_location = ""
-            self.status_label.config(text="🔴")
-            self.connect_button.config(text="Подключиться", bg='#15354D',
-                                    activebackground='#15354D')  # Тот же цвет при нажатии
-            self.is_connected = False
+    def _apply_refresh(self, generation, values):
+        if self._closed:
+            return
+        if generation != self._refresh_generation:
+            if getattr(self, "_refresh_after_pending", False):
+                self._refresh_after_pending = False
+                self.refresh_state()
+            return
+        license_result = values.get('license')
+        if 'license' in values:
+            self._auth_error = True
+        if isinstance(license_result, subprocess.CompletedProcess):
+            email = self.parse_user_email(license_result.stdout)
+            if email:
+                # Identity can be present even when license retrieval fails.
+                # Retain full facts only when they belong to the same account.
+                if license_result.returncode == 0:
+                    self._license_text = license_result.stdout
+                    self._license_partial = False
+                    self._auth_error = False
+                elif email != self.get_user_email():
+                    self._license_text = f'Logged in as {email}'
+                    self._license_partial = True
+                self.is_logged_in = True
+                self._auth_known = True
+        result = values.get('status')
+        if isinstance(result, subprocess.CompletedProcess) and result.returncode == 0:
+            self.is_connected = check_if_connected(clean_ansi_codes(result.stdout))
+            self.current_location = (clean_location_output(result.stdout) or 'Подключено') if self.is_connected else ''
+        self.update_ui_for_auth_status()
+        self.status_label.config(text='🟢' if self.is_connected else '🔴')
+        color = '#ff3b30' if self.is_connected else '#5BA06A'
+        self.connect_button.config(text='Отключиться' if self.is_connected else 'Подключиться',
+                                   bg=color if self.is_logged_in else '#2a4d6a', activebackground=color)
+        self.update_email_display()
 
     def get_user_email(self):
-        """Получает email пользователя из информации о лицензии"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'license'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                return self.parse_user_email(result.stdout)
-            return None
-        except:
-            return None
+        return self.parse_user_email(self._license_text) if self._license_text else None
 
     def parse_user_email(self, license_text):
         """Парсит email пользователя из вывода adguardvpn-cli license"""
@@ -773,24 +891,18 @@ class AdGuardVPNManager:
 
     def update_email_display(self):
         """Обновляет отображение email пользователя и информации о лицензии"""
+        status = ""
+        email = ""
         if self.is_logged_in:
             email = self.get_user_email()
             license_type = self.get_license_type()
 
             if email:
-                # Сокращаем email для отображения
-                if len(email) > 20:
-                    display_email = email[:15] + "..."
-                else:
-                    display_email = email
-
                 # Для Free версии показываем трафик
                 if license_type == "Free":
                     traffic = self.get_traffic_left()
                     if traffic:
-                        display_text = f"{display_email} ({traffic})"
-                    else:
-                        display_text = display_email
+                        status = f"Трафик: {traffic}"
 
                 # Для Premium версий показываем дни до окончания
                 elif license_type in ["Premium"]:
@@ -799,43 +911,31 @@ class AdGuardVPNManager:
                         days_left = self.get_days_until_expiry(expiry_date)
                         if days_left is not None:
                             if days_left == 0:
-                                display_text = f"{display_email}\n(Лицензия истекает сегодня)"
+                                status = "Лицензия истекает сегодня"
                             elif days_left == 1:
-                                display_text = f"{display_email}\n(До окончания лицензии остался 1 день)"
+                                status = "До окончания лицензии остался 1 день"
                             else:
                                 days_text = self.get_days_text(days_left)
-                                display_text = f"{display_email}\n(Лицензия истекает через {days_left} {days_text})"
+                                status = f"Лицензия истекает через {days_left} {days_text}"
                         else:
-                            display_text = f"{display_email}\n(Лицензия действует до {expiry_date})"
-                    else:
-                        display_text = display_email
+                            status = f"Лицензия действует до {expiry_date}"
 
-                else:
-                    display_text = display_email
-
-                # Устанавливаем текст и цвет для авторизованного пользователя
-                self.email_label.config(text=display_text, fg='#5BA06A')
-            else:
-                self.email_label.config(text="Авторизован", fg='#5BA06A')
+        login = (email or "Авторизован") if self.is_logged_in else ("Не авторизован" if self._auth_known else ("Не удалось проверить аккаунт" if self._auth_error else "Проверка аккаунта…"))
+        changed = (self.email_label.cget('text') != login
+                   or self.account_status_label.cget('text') != status)
+        self.email_label.configure(text=login,
+                                   fg='#5BA06A' if self.is_logged_in else '#8e8e93')
+        self.account_status_label.configure(text=status)
+        if status:
+            self.account_status_label.pack(fill=tk.X)
         else:
-            # Для неавторизованного пользователя
-            self.email_label.config(text="Не авторизован", fg='#8e8e93')
+            self.account_status_label.pack_forget()
+        observer = getattr(self.root, '_scale_observer', None)
+        if changed and observer is not None:
+            observer.refit()
 
     def get_traffic_left(self):
-        """Получает оставшийся трафик из информации о лицензии"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'license'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                return self.parse_traffic_left(result.stdout)
-            return None
-        except:
-            return None
+        return self.parse_traffic_left(self._license_text) if self._license_text else None
 
     def parse_traffic_left(self, license_text):
         """Парсит оставшийся трафик из вывода adguardvpn-cli license"""
@@ -872,27 +972,11 @@ class AdGuardVPNManager:
             return None
 
     def get_license_type(self):
-        """Получает тип лицензии"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'license'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                license_type = self.parse_license_type(result.stdout)
-
-                # Дополнительная проверка: если есть дата окончания - это не Free
-                expiry_date = self.parse_license_expiry(result.stdout)
-                if expiry_date and license_type == "Free":
-                    return "Premium"
-
-                return license_type
-            return "Неизвестно"
-        except:
-            return "Неизвестно"
+        if self.parse_license_expiry(self._license_text):
+            return 'Premium'
+        if self._license_partial:
+            return 'Неизвестно'
+        return self.parse_license_type(self._license_text) if self._license_text else 'Free'
 
     def parse_license_type(self, license_text):
         """Парсит тип лицензии из вывода adguardvpn-cli license"""
@@ -977,20 +1061,7 @@ class AdGuardVPNManager:
 
 
     def get_license_expiry(self):
-        """Получает дату окончания лицензии"""
-        try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'license'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                return self.parse_license_expiry(result.stdout)
-            return None
-        except:
-            return None
+        return self.parse_license_expiry(self._license_text) if self._license_text else None
 
     def parse_license_expiry(self, license_text):
         """Парсит дату окончания лицензии из вывода adguardvpn-cli license"""
@@ -1056,7 +1127,7 @@ class AdGuardVPNManager:
 
     def update_ui_for_auth_status(self):
         """Обновляет состояние UI в зависимости от статуса авторизации"""
-        if self.is_logged_in:
+        if self.is_logged_in and not getattr(self, "_connection_pending", False):
             # Разблокировать кнопки
             self.connect_button.config(state=tk.NORMAL, bg='#15354D')
             # Найти кнопку "Выбрать локацию" (вторая кнопка в left_panel)
@@ -1074,67 +1145,18 @@ class AdGuardVPNManager:
                     break
 
     def schedule_status_update(self):
-        """Периодически обновляет статус"""
-        self.update_status()
-
-        # Обновляем email и трафик каждые 30 секунд
-        static_info_counter = getattr(self, '_static_info_counter', 0) + 1
-        self._static_info_counter = static_info_counter
-
-        if static_info_counter >= 10:  # 30 секунд (10 * 3 секунды)
-            self.update_email_display()  # Теперь обновляет и email и трафик
-            self._static_info_counter = 0
-
-        self.root.after(3000, self.schedule_status_update)
+        if self._closed:
+            return
+        self.refresh_state(include_license=False)
+        self._status_timer = self.root.after(3000, self.schedule_status_update)
 
     def check_connection_status(self):
-        """Проверяет статус подключения и возвращает True если подключен"""
+        """Called by the connection worker; publish state through refresh only."""
         try:
-            result = subprocess.run(
-                ['adguardvpn-cli', 'status'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                status_text = result.stdout.strip()
-                connected = check_if_connected(status_text)
-
-                if connected:
-                    location = clean_location_output(status_text)
-                    if location:
-                        self.current_location = location
-                    else:
-                        detailed_location = self.get_current_location()
-                        if detailed_location:
-                            self.current_location = detailed_location
-                        else:
-                            self.current_location = "🟢"
-                    return True
-                else:
-                    self.current_location = ""
-                    return False
-
-            result = subprocess.run(
-                ['adguardvpn-cli', 'list-locations'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                current_location = self.get_current_location()
-                if current_location:
-                    self.current_location = current_location
-                else:
-                    self.current_location = "🟢"
-                return True
-
-            return False
-
-        except Exception as e:
-            self.current_location = ""
+            result = subprocess.run(['adguardvpn-cli', 'status'], capture_output=True,
+                                    text=True, timeout=5)
+            return result.returncode == 0 and check_if_connected(clean_ansi_codes(result.stdout))
+        except Exception:
             return False
 
     def get_current_location(self):
@@ -1185,14 +1207,15 @@ class AdGuardVPNManager:
 
     def connect_vpn(self):
         """Подключается к VPN через внешнюю консоль"""
+        if getattr(self, "_connection_pending", False):
+            self.log_message("Подключение уже выполняется. Дождитесь завершения.")
+            return
         if self.is_connected:
             self.disconnect_vpn()
             return
 
         # Запускаем в отдельном потоке, чтобы GUI не блокировался
-        thread = threading.Thread(target=self._connect_vpn_thread)
-        thread.daemon = True
-        thread.start()
+        self._submit_connection(self._connect_vpn_thread)
 
     def _connect_vpn_thread(self):
         self.log_message("🔗 Запуск подключения в терминале...")
@@ -1210,6 +1233,8 @@ class AdGuardVPNManager:
             # Проверяем статус подключения
             max_attempts = 5
             for attempt in range(max_attempts):
+                if self._closed:
+                    return
                 self.log_message(f"🔍 Проверка подключения... ({attempt + 1}/{max_attempts})")
 
                 if self.check_connection_status():
@@ -1228,6 +1253,9 @@ class AdGuardVPNManager:
 
     def select_location(self):
         """Подключение к выбранной локации через внешнюю консоль"""
+        if getattr(self, "_connection_pending", False):
+            self.log_message("Подключение уже выполняется. Дождитесь завершения.")
+            return
         location_window = LocationSelectionWindow(self.root)
         selected_location = location_window.run()
 
@@ -1235,9 +1263,23 @@ class AdGuardVPNManager:
             return
 
         # Запускаем в отдельном потоке
-        thread = threading.Thread(target=self._select_location_thread, args=(selected_location,))
-        thread.daemon = True
-        thread.start()
+        self._submit_connection(lambda: self._select_location_thread(selected_location))
+
+    def _submit_connection(self, work):
+        def done(result):
+            self._connection_pending = False
+            self.update_ui_for_auth_status()
+            self.update_status()
+        def failed(error):
+            self.log_message(f'❌ Ошибка подключения: {error}')
+            done(None)
+        accepted = self.tasks.submit(work, done, failed, key='connect')
+        if accepted:
+            self._connection_pending = True
+            self.update_ui_for_auth_status()
+        else:
+            self.log_message('Подключение уже выполняется. Дождитесь завершения.')
+        return accepted
 
     def _select_location_thread(self, selected_location):
         """Поток для подключения к выбранной локации с автоматическими ответами"""
@@ -1259,6 +1301,8 @@ class AdGuardVPNManager:
             connected = False
 
             for attempt in range(max_attempts):
+                if self._closed:
+                    return
                 self.update_status()
                 if self.check_connection_status():
                     connected = True
@@ -1288,63 +1332,39 @@ class AdGuardVPNManager:
         license_window.run()
 
     def disconnect_vpn(self):
-        """Отключает VPN"""
-        try:
-            self.log_message("🔒 Отключение VPN...")
+        self.log_message('🔒 Отключение VPN...')
+        self.tasks.submit(lambda: subprocess.run(['adguardvpn-cli', 'disconnect'],
+            capture_output=True, text=True, timeout=10), self._disconnect_done,
+            lambda error: self.log_message(f'❌ Ошибка отключения: {error}'), key='disconnect')
 
-            # Простая команда без терминала - как в старой версии
-            result = subprocess.run(
-                ['adguardvpn-cli', 'disconnect'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.log_message("✅ VPN отключен")
-                self.update_status()
-            else:
-                self.log_message("❌ Не удалось отключить VPN")
-
-        except Exception as e:
-            self.log_message(f"❌ Ошибка при отключении: {str(e)}")
+    def _disconnect_done(self, result):
+        self.log_message('✅ VPN отключен' if result.returncode == 0 else '❌ Не удалось отключить VPN')
+        self.refresh_state()
 
     def logout(self):
-        """Выход из аккаунта"""
-        if show_question_dialog(self.root, "Подтверждение", "Вы уверены, что хотите выйти из аккаунта?"):
-            # Запускаем выход в отдельном потоке
-            thread = threading.Thread(target=self._logout_thread)
-            thread.daemon = True
-            thread.start()
+        if show_question_dialog(self.root, 'Подтверждение', 'Вы уверены, что хотите выйти из аккаунта?'):
+            self._refresh_generation += 1
+            self._logout_pending = True
+            connected = self.is_connected
+            def work():
+                if connected:
+                    subprocess.run(['adguardvpn-cli', 'disconnect'], capture_output=True, text=True, timeout=10)
+                return subprocess.run(['adguardvpn-cli', 'logout'], capture_output=True, text=True, timeout=10)
+            self.tasks.submit(work, lambda result: self._logout_success() if result.returncode == 0 else self._logout_failed(),
+                              lambda error: self._logout_error(str(error)), key='logout')
 
     def _logout_thread(self):
-        """Поток для обработки выхода из аккаунта"""
-        try:
-            self.log_message("🚪 Выход из аккаунта...")
-
-            # Отключаем VPN перед выходом из аккаунта
-            if self.is_connected:
-                self.disconnect_vpn()
-                time.sleep(2)
-
-            # Выходим из аккаунта
-            result = subprocess.run(
-                ['adguardvpn-cli', 'logout'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.root.after(0, self._logout_success)
-            else:
-                self.root.after(0, self._logout_failed)
-
-        except Exception as e:
-            self.root.after(0, lambda: self._logout_error(str(e)))
+        self.tasks.post(self.logout)
 
     def _logout_success(self):
         """Обновляет GUI после успешного выхода"""
+        self._refresh_generation += 1
+        self._logout_pending = False
+        self._auth_known = True
+        self._refresh_after_pending = False
+        self._license_text = ""
+        self._license_partial = False
+        self.is_connected = False
         self.is_logged_in = False
         self.update_email_display()
         self.update_ui_for_auth_status()
@@ -1357,44 +1377,49 @@ class AdGuardVPNManager:
 
     def _logout_failed(self):
         """Обновляет GUI после неудачного выхода"""
+        self._logout_pending = False
         self.log_message("❌ Не удалось выйти из аккаунта")
 
     def _logout_error(self, error_msg):
         """Обновляет GUI при ошибке выхода"""
+        self._logout_pending = False
         self.log_message(f"❌ Ошибка при выходе: {error_msg}")
 
     def toggle_auth(self):
-        """Единый обработчик для входа/выхода из аккаунта"""
         if self.is_logged_in:
             self.logout()
         else:
-            # Запускаем авторизацию в отдельном потоке
-            thread = threading.Thread(target=self._login_thread)
-            thread.daemon = True
-            thread.start()
+            self._login_thread()
 
     def _login_thread(self):
-        """Поток для обработки авторизации"""
+        if threading.get_ident() != self._main_thread:
+            self.tasks.post(self._login_thread)
+            return
+        if getattr(self, '_login_open', False):
+            return
+        self._login_open = True
+        self._refresh_generation += 1
         try:
-            # Создаем окно авторизации в этом потоке
-            auth_window = ManagerAuthWindow(self.root)
-            auth_success = auth_window.run()
-
-            if auth_success:
-                # Обновляем GUI в основном потоке
-                self.root.after(0, self._login_success)
+            window = ManagerAuthWindow(self.root)
+            if window.run() and not self._closed:
+                self._login_success()
             else:
-                self.root.after(0, self._login_failed)
-
-        except Exception as e:
-            self.root.after(0, lambda: self._login_error(str(e)))
+                self._login_failed()
+        except Exception as error:
+            self._login_error(str(error))
+        finally:
+            self._login_open = False
 
     def _login_success(self):
-        """Обновляет GUI после успешной авторизации"""
+        self._refresh_generation += 1
+        self._refresh_after_pending = True
+        self._last_license_refresh = float("-inf")
         self.is_logged_in = True
+        self._auth_known = True
         self.update_email_display()
         self.update_ui_for_auth_status()
-        self.log_message("✅ Успешный вход в аккаунт")
+        self.refresh_state()
+        self.log_message('✅ Успешный вход в аккаунт')
 
     def _login_failed(self):
         """Обновляет GUI после неудачной авторизации"""
@@ -1410,9 +1435,23 @@ class AdGuardVPNManager:
         uninstall_window.run()
 
     def close_app(self):
-        """Закрывает приложение"""
+        self._closed = True
+        self._refresh_generation += 1
+        if self._status_timer is not None:
+            self.root.after_cancel(self._status_timer)
+            self._status_timer = None
+        self.tasks.close()
         self.close_all_menus()
-        sys.exit()
+        self.root.destroy()
+
+    def _on_destroy(self, event):
+        if event.widget is self.root:
+            self._closed = True
+            self._refresh_generation += 1
+            if self._status_timer is not None:
+                self.root.after_cancel(self._status_timer)
+                self._status_timer = None
+            self.tasks.close()
 
     def run(self):
         self.root.mainloop()

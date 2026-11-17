@@ -1,6 +1,8 @@
+from core.ui_scaling import grab_when_visible
+from core.ui_tasks import TaskRunner
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
 import subprocess
-import threading
 import re
 import os
 from ui.components.button_styler import create_hover_button, apply_hover_effect
@@ -13,61 +15,9 @@ class SettingsWindow:
         self.setup_window_properties()
         self.root.title("Настройки AdGuard VPN")
 
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 525
-        base_height = 520
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 20, screen_width + 20)
-            height = min(base_height + 50, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
-
         self.root.configure(bg='#182030')
         self.root.transient(parent)
-        self.root.grab_set()
+        grab_when_visible(self.root)
 
         try:
             from tkinter import ttk
@@ -76,6 +26,8 @@ class SettingsWindow:
         except:
             pass
 
+        self.tasks = TaskRunner(self.root)
+        self._load_generation = 0
         self.setup_ui()
         self.load_current_settings()
 
@@ -101,8 +53,8 @@ class SettingsWindow:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (690, 560), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="Настройки AdGuard VPN",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
@@ -110,17 +62,17 @@ class SettingsWindow:
 
         # Создаем контейнер для двух колонок
         columns_frame = tk.Frame(main_frame, bg='#182030')
-        columns_frame.pack(fill=tk.BOTH, expand=True)
+        columns_frame.pack(fill=tk.X)
 
         # Левая колонка - Основные настройки
-        left_column = tk.Frame(columns_frame, bg='#182030', width=300)
+        left_column = tk.Frame(columns_frame, bg='#182030')
         left_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        left_column.pack_propagate(False)
+
 
         # Правая колонка - Дополнительные настройки
-        right_column = tk.Frame(columns_frame, bg='#182030', width=300)
+        right_column = tk.Frame(columns_frame, bg='#182030')
         right_column.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        right_column.pack_propagate(False)
+
 
         button_style = {
             'font': ('Arial', 10),
@@ -134,11 +86,14 @@ class SettingsWindow:
             'cursor': 'hand2'
         }
 
+        self.page.responsive_columns(columns_frame, (left_column, right_column), gap=20,
+                                     equal_width=False, fit_width=True)
+
         # === ЛЕВАЯ КОЛОНКА - ОСНОВНЫЕ НАСТРОЙКИ ===
 
         # Настройка режима VPN
-        mode_frame = tk.Frame(left_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=5, pady=5)
-        mode_frame.pack(fill=tk.X, pady=(0, 15))
+        mode_frame = tk.Frame(left_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=0, pady=0)
+        mode_frame.pack(fill=tk.X, pady=(0, 16))
 
         tk.Label(mode_frame, text="Режим VPN:",
                 font=("Arial", 12, "bold"), fg='white', bg='#182030').pack(anchor=tk.W)
@@ -163,14 +118,16 @@ class SettingsWindow:
                                        activeforeground='white', bd=0, highlightthickness=0, cursor="hand2")
         self.socks_btn.pack(side=tk.LEFT)
 
+        self.page.responsive_row(mode_buttons_frame, (self.tun_btn, self.socks_btn), gap=12, align="left")
+
         # Кнопка применения режима
         apply_btn = create_hover_button(mode_frame, text="Применить",
                                         command=self.apply_mode, **button_style)
-        apply_btn.pack(anchor=tk.W, pady=(10, 0))
+        apply_btn.pack(anchor=tk.W, pady=(6, 0))
 
         # Настройка DNS-адреса
-        dns_frame = tk.Frame(left_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=5, pady=5)
-        dns_frame.pack(fill=tk.X, pady=(0, 15))
+        dns_frame = tk.Frame(left_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=0, pady=0)
+        dns_frame.pack(fill=tk.X, pady=(0, 16))
 
         tk.Label(dns_frame, text="DNS-настройки:",
                 font=("Arial", 12, "bold"), fg='white', bg='#182030').pack(anchor=tk.W)
@@ -189,7 +146,7 @@ class SettingsWindow:
 
         # Кнопки для DNS
         dns_buttons_frame = tk.Frame(dns_frame, bg='#182030')
-        dns_buttons_frame.pack(fill=tk.X, pady=(10, 0))
+        dns_buttons_frame.pack(fill=tk.X, pady=(6, 0))
 
         apply_dns_btn = create_hover_button(dns_buttons_frame, text="Применить DNS",
                                             command=self.set_dns, **button_style)
@@ -201,10 +158,12 @@ class SettingsWindow:
         default_btn.pack(side=tk.LEFT, padx=(0, 10))
 
 
+        self.page.responsive_row(dns_buttons_frame, (apply_dns_btn, default_btn), gap=10, align="left")
+
         # === ПРАВАЯ КОЛОНКА - ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ ===
         # Настройка режима маршрутизации VPN-туннеля
-        routing_frame = tk.Frame(right_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=5, pady=5)
-        routing_frame.pack(fill=tk.X, pady=(0, 15))
+        routing_frame = tk.Frame(right_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=0, pady=0)
+        routing_frame.pack(fill=tk.X, pady=(0, 16))
 
         tk.Label(routing_frame, text="Режим VPN-туннеля:",
                 font=("Arial", 12, "bold"), fg='white', bg='#182030').pack(anchor=tk.W)
@@ -229,13 +188,15 @@ class SettingsWindow:
                                               activeforeground='white', bd=0, highlightthickness=0, cursor="hand2")
         self.routing_auto_btn.pack(side=tk.LEFT)
 
+        self.page.responsive_row(routing_buttons_frame, (self.routing_none_btn, self.routing_auto_btn), gap=12, align="left")
+
         # Кнопка применения режима маршрутизации
         apply_tun_btn = create_hover_button(routing_frame, text="Применить",
                                             command=self.apply_routing_mode, **button_style)
-        apply_tun_btn.pack(anchor=tk.W, pady=(10, 0))
+        apply_tun_btn.pack(anchor=tk.W, pady=(6, 0))
 
         # Настройка порта SOCKS5
-        port_frame = tk.Frame(right_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=5, pady=5)
+        port_frame = tk.Frame(right_column, bg='#182030', relief=tk.GROOVE, bd=0, padx=0, pady=0)
         port_frame.pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(port_frame, text="Порт SOCKS5:",
@@ -256,7 +217,7 @@ class SettingsWindow:
         # Кнопка установки порта
         apply_port_btn = create_hover_button(port_frame, text="Установить порт",
                                              command=self.set_socks_port, **button_style)
-        apply_port_btn.pack(anchor=tk.W, pady=(10, 0))
+        apply_port_btn.pack(anchor=tk.W, pady=(6, 0))
 
         # # Пустое пространство для выравнивания
         # spacer_frame = tk.Frame(right_column, bg='#182030')
@@ -279,84 +240,52 @@ class SettingsWindow:
         )
 
         info_label = tk.Label(info_frame, text=info_text, font=("Arial", 10),
-                             fg='#8e8e93', bg='#182030', justify=tk.LEFT)
-        info_label.pack(anchor=tk.W, pady=0)
+                             fg='#8e8e93', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        info_label.pack(fill=tk.X, pady=0)
+        self.page.wrap(info_label)
 
         # Статус бар внизу основного окна
         self.status_var = tk.StringVar(value="Готов к настройке")
         status_bar = tk.Label(main_frame, textvariable=self.status_var,
                              relief=tk.SUNKEN, anchor=tk.W, bg='#15354D', fg='white', highlightthickness=0)
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(20, 0))
+        status_bar.pack(fill=tk.X, pady=(16, 0))
+        self.page.wrap(status_bar)
 
         # Кнопка закрытия - по центру
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=5)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=(8, 10))
 
         close_btn = create_hover_button(btn_frame, text="Закрыть",
                                         command=self.close_window, **button_style)
         close_btn.pack(anchor=tk.CENTER)
 
+        self.page.request_fit()
+
     def load_current_settings(self):
-        """Загружает текущие настройки"""
-        try:
-            # Получаем текущий режим VPN
-            result = subprocess.run(
-                ['adguardvpn-cli', 'config', 'get-mode'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                current_mode = result.stdout.strip()
-                if "SOCKS" in current_mode.upper():
-                    self.mode_var.set("SOCKS")
-                else:
-                    self.mode_var.set("TUN")
-
-            # Получаем текущий порт SOCKS5
-            result = subprocess.run(
-                ['adguardvpn-cli', 'config', 'get-socks-port'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                current_port = result.stdout.strip()
-                self.port_entry.delete(0, tk.END)
-                self.port_entry.insert(0, current_port)
-
-            # Получаем текущий DNS
-            result = subprocess.run(
-                ['adguardvpn-cli', 'config', 'get-dns'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                current_dns = result.stdout.strip()
-                self.dns_entry.delete(0, tk.END)
-                self.dns_entry.insert(0, current_dns)
-
-            # Получаем текущий режим маршрутизации
-            result = subprocess.run(
-                ['adguardvpn-cli', 'config', 'get-tun-routing-mode'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if result.returncode == 0:
-                current_routing = result.stdout.strip().upper()
-                if "NONE" in current_routing:
-                    self.routing_var.set("NONE")
-                else:
-                    self.routing_var.set("AUTO")
-
-        except Exception as e:
-            self.status_var.set(f"❌ Ошибка загрузки настроек: {str(e)}")
+        self._load_generation += 1
+        generation = self._load_generation
+        initial = (self.mode_var.get(), self.port_entry.get(), self.dns_entry.get(), self.routing_var.get())
+        def work():
+            values = {}
+            for name in ('get-mode', 'get-socks-port', 'get-dns', 'get-tun-routing-mode'):
+                result = subprocess.run(['adguardvpn-cli', 'config', name], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    values[name] = result.stdout.strip()
+            return values
+        def apply(values):
+            if generation != self._load_generation:
+                return
+            if self.mode_var.get() == initial[0] and 'get-mode' in values:
+                self.mode_var.set('SOCKS' if 'SOCKS' in values['get-mode'].upper() else 'TUN')
+            for entry, old, name in ((self.port_entry, initial[1], 'get-socks-port'), (self.dns_entry, initial[2], 'get-dns')):
+                if entry.get() == old and name in values:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, values[name])
+            if self.routing_var.get() == initial[3] and 'get-tun-routing-mode' in values:
+                self.routing_var.set('NONE' if 'NONE' in values['get-tun-routing-mode'].upper() else 'AUTO')
+            self.status_var.set('Настройки загружены')
+        self.status_var.set('Загрузка настроек…')
+        self.tasks.submit(work, apply, lambda error: self.status_var.set(f'❌ Ошибка загрузки настроек: {error}'), key='load')
 
     def apply_mode(self):
         """Применяет выбранный режим VPN"""
@@ -367,11 +296,7 @@ class SettingsWindow:
         else:
             command = ['adguardvpn-cli', 'config', 'set-mode', 'TUN']
 
-        thread = threading.Thread(target=self._apply_setting_thread,
-                                args=(command, f"Режим {selected_mode} успешно установлен"))
-
-        thread.daemon = True
-        thread.start()
+        self._apply_setting_thread(command, f"Режим {selected_mode} успешно установлен")
 
     def set_socks_port(self):
         """Устанавливает порт SOCKS5"""
@@ -392,10 +317,7 @@ class SettingsWindow:
 
         command = ['adguardvpn-cli', 'config', 'set-socks-port', str(port)]
 
-        thread = threading.Thread(target=self._apply_setting_thread,
-                                args=(command, f"Порт SOCKS5 изменен на {port}"))
-        thread.daemon = True
-        thread.start()
+        self._apply_setting_thread(command, f"Порт SOCKS5 изменен на {port}")
 
     def set_dns(self):
         """Устанавливает DNS-сервер"""
@@ -412,10 +334,7 @@ class SettingsWindow:
 
         command = ['adguardvpn-cli', 'config', 'set-dns', dns_address]
 
-        thread = threading.Thread(target=self._apply_setting_thread,
-                                args=(command, f"DNS-сервер изменен на {dns_address}"))
-        thread.daemon = True
-        thread.start()
+        self._apply_setting_thread(command, f"DNS-сервер изменен на {dns_address}")
 
     def set_default_dns(self):
         """Возвращает DNS настройки к значениям по умолчанию"""
@@ -428,10 +347,7 @@ class SettingsWindow:
         # Применяем настройку
         command = ['adguardvpn-cli', 'config', 'set-dns', default_dns]
 
-        thread = threading.Thread(target=self._apply_setting_thread,
-                                args=(command, f"DNS восстановлен по умолчанию: {default_dns}"))
-        thread.daemon = True
-        thread.start()
+        self._apply_setting_thread(command, f"DNS восстановлен по умолчанию: {default_dns}")
 
     def apply_routing_mode(self):
         """Применяет выбранный режим маршрутизации"""
@@ -439,34 +355,42 @@ class SettingsWindow:
 
         command = ['adguardvpn-cli', 'config', 'set-tun-routing-mode', selected_routing]
 
-        thread = threading.Thread(target=self._apply_setting_thread,
-                                args=(command, f"Режим маршрутизации изменен на {selected_routing}"))
-        thread.daemon = True
-        thread.start()
+        self._apply_setting_thread(command, f"Режим маршрутизации изменен на {selected_routing}")
 
     def _apply_setting_thread(self, command, success_message):
-        """Общий поток для применения настроек"""
-        try:
-            setting_name = command[2]  # Получаем название настройки из команды
-            self.root.after(0, lambda: self.status_var.set(f"Установка {setting_name}..."))
+        self._load_generation += 1
+        if not hasattr(self, '_setting_pending'):
+            self._setting_pending = {}
+            self._setting_active = set()
+        key = command[2]
+        self._setting_pending[key] = (list(command), success_message)
+        if key in self._setting_active:
+            self.status_var.set(f'Ожидание применения {key}…')
+            return
+        self._start_setting(key)
 
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.root.after(0, lambda: self.status_var.set(f"✅ {success_message}"))
+    def _start_setting(self, key):
+        command, success_message = self._setting_pending.pop(key)
+        self._setting_active.add(key)
+        self.status_var.set(f'Установка {key}…')
+        def finish(result=None, error=None):
+            self._setting_active.discard(key)
+            if key in self._setting_pending:
+                self._start_setting(key)
+                return
+            if error is not None:
+                message = f'❌ Ошибка изменения настройки: {error}'
+            elif result.returncode == 0:
+                message = f'✅ {success_message}'
             else:
-                error_msg = result.stderr if result.stderr else "Неизвестная ошибка"
-                self.root.after(0, lambda: self.status_var.set(f"❌ Не удалось изменить настройку: {error_msg}"))
-
-        except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(f"❌ Ошибка при изменении настройки: {str(e)}"))
+                message = f'❌ Не удалось изменить настройку: {result.stderr}'
+            self.status_var.set(message)
+        self.tasks.submit(lambda: subprocess.run(command, capture_output=True, text=True, timeout=10),
+                          finish, lambda error: finish(error=error), key=key)
 
     def close_window(self):
+        self._load_generation += 1
+        self.tasks.close()
         self.root.destroy()
 
     def run(self):

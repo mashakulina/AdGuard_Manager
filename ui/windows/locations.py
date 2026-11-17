@@ -1,3 +1,6 @@
+from core.ui_scaling import grab_when_visible
+from core.ui_tasks import TaskRunner
+from core.ui_scaling import observe_window
 import tkinter as tk
 from tkinter import ttk
 import subprocess
@@ -13,10 +16,9 @@ class LocationSelectionWindow:
         self.root = tk.Toplevel(parent)
         self.setup_window_properties()
         self.root.title("Выбор локации")
-        self.root.geometry("520x400")
         self.root.configure(bg='#182030')
         self.root.transient(parent)
-        self.root.grab_set()
+        grab_when_visible(self.root)
 
         try:
             from tkinter import ttk
@@ -25,6 +27,7 @@ class LocationSelectionWindow:
         except:
             pass
 
+        self.tasks = TaskRunner(self.root)
         self.selected_location = None
         self.setup_ui()
 
@@ -52,6 +55,8 @@ class LocationSelectionWindow:
     def setup_ui(self):
         main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
+        footer = tk.Frame(main_frame, bg='#182030')
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
 
         title_label = tk.Label(main_frame, text="Выберите локацию для подключения",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
@@ -60,10 +65,6 @@ class LocationSelectionWindow:
         # Фрейм для списка локаций
         list_frame = tk.Frame(main_frame, bg='#182030')
         list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        # Создаем Treeview для отображения локаций
-        columns = ("ISO", "Country", "City", "Ping")
-        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
 
         # Основной стиль таблицы
         style = ttk.Style()
@@ -129,12 +130,14 @@ class LocationSelectionWindow:
                                  style="Custom.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
 
         # Кнопки
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame = tk.Frame(footer, bg='#182030')
+        btn_frame.pack()
 
         button_style = {
             'font': ('Arial', 10),
@@ -157,33 +160,44 @@ class LocationSelectionWindow:
         back_btn.grid(row=0, column=2)
 
         # Центрируем весь фрейм с кнопками
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
-        btn_frame.grid_columnconfigure(2, weight=1)
-        btn_frame.grid_columnconfigure(3, weight=1)
+        def layout(width=None):
+            active_font = style.lookup("Treeview", "font")
+            line_height = int(self.root.tk.call('font', 'metrics', active_font, '-linespace'))
+            style.configure("Treeview", rowheight=line_height + 10)
+            heading_font = style.lookup("Treeview.Heading", "font")
+            for column in ("ISO", "Ping"):
+                heading_width = int(self.root.tk.call('font', 'measure', heading_font,
+                                                      self.tree.heading(column, 'text')))
+                self.tree.column(column, minwidth=heading_width + 16)
+            self.tree.column("Country", minwidth=int(self.root.tk.call('font', 'measure', active_font, "United Kingdom")) + 16)
+            self.tree.column("City", minwidth=int(self.root.tk.call('font', 'measure', active_font, "Amsterdam")) + 16)
+            available_width = self.root.winfo_width() if width is None else width
+            title_label.configure(wraplength=max(1, available_width - 2 * int(main_frame.cget('padx'))))
+
+        def measure(scale):
+            width = min(self.root.winfo_screenwidth() - 16, round(590 * scale))
+            layout(width)
+            self.root.update_idletasks()
+            rowheight = int(style.lookup("Treeview", "rowheight"))
+            heading_height = int(self.root.tk.call('font', 'metrics', style.lookup("Treeview.Heading", "font"), '-linespace'))
+            list_height = 10 * rowheight + heading_height + round(12 * scale)
+            height = title_label.winfo_reqheight() + footer.winfo_reqheight() + list_height + round(80 * scale)
+            return width, height
+
+        self.observer = observe_window(self.root, (590, 440), layout=layout,
+                                       parent=self.parent, measure=measure)
 
     def load_locations(self):
-        """Загружает список локаций через adguardvpn-cli list-locations"""
-        try:
-            # Очищаем таблицу
+        def apply(result):
+            if result.returncode != 0:
+                show_message_dialog(self.root, 'Ошибка', 'Не удалось получить список локаций', 'error')
+                return
             for item in self.tree.get_children():
                 self.tree.delete(item)
-
-            # Получаем список локаций
-            result = subprocess.run(
-                ['adguardvpn-cli', 'list-locations'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode == 0:
-                self.parse_locations_output(result.stdout)
-            else:
-                self.root.after(0, lambda: show_message_dialog(self.root, "Ошибка", "Не удалось получить список локаций", "error"))
-
-        except Exception as e:
-            self.root.after(0, lambda: show_message_dialog(self.root, "Ошибка", f"Ошибка при получении локаций: {str(e)}", "error"))
+            self.parse_locations_output(result.stdout)
+        self.tasks.submit(lambda: subprocess.run(['adguardvpn-cli', 'list-locations'],
+            capture_output=True, text=True, timeout=10), apply,
+            lambda error: show_message_dialog(self.root, 'Ошибка', f'Ошибка получения локаций: {error}', 'error'), key='locations')
 
     def parse_locations_output(self, output):
         """Парсит вывод команды list-locations"""
@@ -227,43 +241,23 @@ class LocationSelectionWindow:
         return ansi_escape.sub('', text)
 
     def parse_table_line(self, line):
-        """Парсит строку таблицы с фиксированными колонками"""
-        try:
-            # Сначала очищаем от ANSI кодов на всякий случай
-            line = self.clean_ansi_codes(line)
-
-            # Убираем лишние пробелы
-            line = ' '.join(line.split())
-
-            # Разбиваем на части
+        """Preserve multiword cells in the CLI's padded or tabular output."""
+        line = self.clean_ansi_codes(line).strip()
+        columns = re.split(r'[ \t]{2,}|\t', line)
+        if len(columns) == 4:
+            iso, country, city, ping = (column.strip() for column in columns)
+        elif len(columns) == 1:
+            # Legacy compact fixtures have no column separators. Their city
+            # is necessarily a single word because boundaries are ambiguous.
             parts = line.split()
             if len(parts) < 4:
                 return None
-
-            # ISO код - первые 2 символа
-            iso = parts[0]
-
-            # Пинг - последнее число
-            ping = parts[-1]
-            if not ping.isdigit():
-                return None
-
-            # Все что между ISO и ping - это страна и город
-            middle_parts = parts[1:-1]
-
-            if len(middle_parts) < 2:
-                return None
-
-            # Город - последнее слово в middle_parts
-            city = middle_parts[-1]
-            # Страна - все остальное
-            country = ' '.join(middle_parts[:-1])
-
-            return (iso, country, city, ping)
-
-        except Exception as e:
-            print(f"Ошибка парсинга строки: '{line}' - {e}")
+            iso, country, city, ping = parts[0], ' '.join(parts[1:-2]), parts[-2], parts[-1]
+        else:
             return None
+        if not re.fullmatch(r'[A-Z]{2}', iso) or not country or not city or not re.fullmatch(r'[0-9]+', ping):
+            return None
+        return iso, country, city, ping
 
     def select_location(self):
         selected_item = self.tree.selection()
@@ -275,10 +269,12 @@ class LocationSelectionWindow:
 
         # Используем город как локацию для подключения
         self.selected_location = location_data[2]  # Город
+        self.tasks.close()
         self.root.destroy()
 
     def close_window(self):
         self.selected_location = None
+        self.tasks.close()
         self.root.destroy()
 
     def run(self):

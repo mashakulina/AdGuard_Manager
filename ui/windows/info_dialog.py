@@ -1,5 +1,7 @@
+from core.ui_tasks import TaskRunner
+from utils.browser import open_url
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
-import webbrowser
 import subprocess
 import urllib.parse
 import re
@@ -153,6 +155,7 @@ def check_site_availability_simple(url):
 def show_info_dialog(parent):
     """Показывает диалоговое окно с информацией о AdGuard VPN"""
     dialog = tk.Toplevel(parent)
+    tasks = TaskRunner(dialog)
 
     # Применяем настройки окна
     try:
@@ -172,58 +175,16 @@ def show_info_dialog(parent):
     dialog.configure(bg='#182030')
     dialog.transient(parent)
 
-    def is_steamdeck():
-        """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-        try:
-            # Проверяем /etc/os-release
-            if os.path.exists("/etc/os-release"):
-                with open("/etc/os-release") as f:
-                    os_info = f.read().lower()
-                    if "steamos" in os_info or "steam deck" in os_info:
-                        return True
-
-            # Проверяем по системному имени (fallback)
-            sys_name = platform.uname().machine.lower()
-            if "steam" in sys_name or "deck" in sys_name:
-                return True
-
-            # Проверяем compositor (часто Gamescope)
-            result = subprocess.run(
-                ["ps", "-A"], capture_output=True, text=True
-            )
-            if "gamescope" in result.stdout.lower():
-                return True
-        except:
-            pass
-        return False
-
-    # Определяем размеры экрана
-    screen_width = dialog.winfo_screenwidth()
-    screen_height = dialog.winfo_screenheight()
-
-    # Базовые размеры
-    base_width = 395
-    base_height = 380
-
-    if is_steamdeck():
-        width = min(base_width + 20, screen_width + 20)
-        height = min(base_height + 30, screen_height + 40)
-        dialog.geometry(f"{width}x{height}")
-    else:
-        # На обычных системах (CachyOS, Windows, etc.)
-        width = base_width
-        height = base_height
-        dialog.geometry(f"{width}x{height}")
-
+    page = AdaptivePage(dialog, (430, 470), parent)
     # Заголовок
-    title_frame = tk.Frame(dialog, bg='#182030', pady=15)
-    title_frame.pack(fill=tk.X)
+    title_frame = tk.Frame(page.body, bg='#182030')
+    title_frame.pack(fill=tk.X, pady=(0, 15))
 
     tk.Label(title_frame, text="Информация",
              font=("Arial", 14, "bold"), bg='#182030', fg='white').pack()
 
     # Основное содержимое
-    content_frame = tk.Frame(dialog, bg='#182030', padx=20)
+    content_frame = tk.Frame(page.body, bg='#182030')
     content_frame.pack(fill=tk.BOTH, expand=True)
 
     # Информационное сообщение
@@ -247,17 +208,25 @@ def show_info_dialog(parent):
                         justify=tk.CENTER
                         )
     info_label.pack(fill=tk.X)
+    page.wrap(info_label)
+
+    def browser_result(opened):
+        if not opened:
+            info_label.configure(text='Не удалось открыть браузер. Попробуйте ещё раз.')
+            page.request_fit()
+
+    def browser_error(error):
+        browser_result(False)
 
     # Сначала объявляем функции для ссылок
     def open_official_page(event):
-        available_site = get_available_site()
-        webbrowser.open(available_site)
+        tasks.submit(lambda: open_url(get_available_site()), browser_result, browser_error, key='browser')
 
     def open_knowledge_base(event):
-        webbrowser.open("https://adguard-vpn.com/kb/")
+        tasks.submit(lambda: open_url('https://adguard-vpn.com/kb/'), browser_result, browser_error, key='browser')
 
     def open_github_page(event):
-        webbrowser.open("https://github.com/mashakulina/AdGuard_Manager")
+        tasks.submit(lambda: open_url('https://github.com/mashakulina/AdGuard_Manager'), browser_result, browser_error, key='browser')
 
     # Функция для создания ссылки с разделенной иконкой и текстом
     def create_link_with_icon(parent, icon, text, command_func):
@@ -267,7 +236,7 @@ def show_info_dialog(parent):
         # Иконка (без подчеркивания)
         icon_label = tk.Label(link_frame, text=icon, font=('Arial', 11),
                             bg='#182030', fg='#3CAA3C', cursor='hand2')
-        icon_label.pack(side=tk.LEFT)
+        icon_label.grid(row=0, column=0, sticky='nw', padx=(0, 8))
         icon_label.bind("<Button-1>", command_func)
         icon_label.bind("<Enter>", lambda e: (icon_label.config(fg='#4d8058'),
                                             text_label.config(fg='#4d8058', font=('Arial', 11, 'underline'))))
@@ -276,8 +245,10 @@ def show_info_dialog(parent):
 
         # Текст (с подчеркиванием при наведении)
         text_label = tk.Label(link_frame, text=text, font=('Arial', 11),
-                            bg='#182030', fg='#3CAA3C', cursor='hand2')
-        text_label.pack(side=tk.LEFT)
+                            bg='#182030', fg='#3CAA3C', cursor='hand2', justify=tk.LEFT, anchor=tk.W)
+        text_label.grid(row=0, column=1, sticky='ew')
+        link_frame.grid_columnconfigure(1, weight=1)
+        page.wrap(text_label, reserve=lambda: icon_label.winfo_reqwidth() + 8)
         text_label.bind("<Button-1>", command_func)
         text_label.bind("<Enter>", lambda e: (icon_label.config(fg='#4d8058'),
                                             text_label.config(fg='#4d8058', font=('Arial', 11, 'underline'))))
@@ -296,17 +267,23 @@ def show_info_dialog(parent):
     versions_frame.pack(fill=tk.X, pady=(10,0))
 
     # Версия AdGuard VPN и менеджера в одну строку
-    vpn_version = get_adguard_current_version()
+    vpn_version = 'Загрузка…'
     manager_version = get_manager_version()
 
     version_text = f"AdGuard VPN: {vpn_version} | AdGuard VPN Manager: {manager_version}"
     version_label = tk.Label(versions_frame, text=version_text,
                            font=("Arial", 9), fg='#5BA06A', bg='#182030')
-    version_label.pack(anchor=tk.CENTER)
+    version_label.pack(fill=tk.X)
+    page.wrap(version_label)
+    def apply_version(version):
+        version_label.configure(text=f'AdGuard VPN: {version} | AdGuard VPN Manager: {manager_version}')
+        page.request_fit()
+    tasks.submit(get_adguard_current_version, apply_version,
+                 lambda error: apply_version('Неизвестно'), key='version')
 
     # Кнопка закрытия
-    button_frame = tk.Frame(dialog, bg='#182030')
-    button_frame.pack(fill=tk.X, pady=(0,15))
+    button_frame = tk.Frame(page.footer, bg='#182030')
+    button_frame.pack(fill=tk.X, pady=(5, 0))
 
     close_style = {
         'font': ('Arial', 10),
@@ -332,4 +309,5 @@ def show_info_dialog(parent):
     dialog.focus_set()
 
     # Ждем закрытия окна
+    page.request_fit()
     dialog.wait_window()

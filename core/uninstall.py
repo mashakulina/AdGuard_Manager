@@ -1,3 +1,5 @@
+from core.ui_scaling import grab_when_visible
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import subprocess
@@ -13,10 +15,9 @@ class SudoPasswordWindow:
         self.root = tk.Toplevel(parent)
         self.setup_window_properties()
         self.root.title("Аутентификация")
-        self.root.geometry("270x280")
         self.root.configure(bg='#182030')
         self.root.transient(parent)
-        self.root.grab_set()
+        grab_when_visible(self.root)
 
         try:
             from tkinter import ttk
@@ -50,17 +51,18 @@ class SudoPasswordWindow:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (370, 360), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="Аутентификация",
-                              font=("Arial", 14, "bold"), fg='white', bg='#182030')
-        title_label.pack(pady=5)
+                              font=("Arial", 16, "bold"), fg='white', bg='#182030')
+        title_label.pack(pady=10)
 
         desc_label = tk.Label(main_frame,
                              text="Для удаления AdGuard VPN\nтребуется права администратора",
                              font=("Arial", 10), fg='white', bg='#182030')
-        desc_label.pack(pady=5)
+        desc_label.pack(fill=tk.X, pady=5)
+        self.page.wrap(desc_label)
 
         sudo_frame = tk.Frame(main_frame, bg='#182030')
         sudo_frame.pack(fill=tk.X, pady=10)
@@ -68,13 +70,13 @@ class SudoPasswordWindow:
         tk.Label(sudo_frame, text="Введите пароль:",
                 fg='white', bg='#182030').pack(anchor=tk.W)
 
-        self.sudo_entry = tk.Entry(sudo_frame, show="*", width=30, font=('Arial', 12),
+        self.sudo_entry = tk.Entry(sudo_frame, show="*", width=1, font=('Arial', 12),
                                   bg='#15354D', fg='white', insertbackground='white')
         self.sudo_entry.pack(fill=tk.X, pady=5)
         self.sudo_entry.bind('<Return>', self.verify_sudo)
         self.sudo_entry.focus()
 
-        btn_frame = tk.Frame(main_frame, bg='#182030')
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
         btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
@@ -105,7 +107,11 @@ class SudoPasswordWindow:
         self.status_var = tk.StringVar(value="Введите пароль")
         status_bar = tk.Label(main_frame, textvariable=self.status_var,
                              relief=tk.SUNKEN, anchor=tk.W, bg='#15354D', fg='white')
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        status_bar.pack(fill=tk.X, pady=(5, 0))
+        self.page.wrap(status_bar)
+
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def verify_sudo(self, event=None):
         password = self.sudo_entry.get()
@@ -139,7 +145,8 @@ class SudoPasswordWindow:
                 self.root.after(0, lambda: self._sudo_verified_fail("❌ Неверный пароль"))
 
         except Exception as e:
-            self.root.after(0, lambda: self._sudo_verified_fail(f"Ошибка: {str(e)}"))
+            error_msg = f"Ошибка: {e}"
+            self.root.after(0, lambda message=error_msg: self._sudo_verified_fail(message))
 
     def _sudo_verified_success(self):
         self.status_var.set("✅ Пароль подтвержден!")
@@ -169,60 +176,9 @@ class UninstallWindow:
         self.root = tk.Toplevel(parent)
         self.setup_window_properties()
         self.root.title("Удаление AdGuard VPN")
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 335
-        base_height = 460
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 20, screen_width + 20)
-            height = min(base_height + 10, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
         self.root.configure(bg='#182030')
         self.root.transient(parent)
-        self.root.grab_set()
+        grab_when_visible(self.root)
 
         try:
             from tkinter import ttk
@@ -263,8 +219,8 @@ class UninstallWindow:
             print(f"Не удалось установить иконку: {e}")
 
     def setup_ui(self):
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (430, 480), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         title_label = tk.Label(main_frame, text="Удаление AdGuard VPN",
                               font=("Arial", 16, "bold"), fg='white', bg='#182030')
@@ -273,7 +229,8 @@ class UninstallWindow:
         warning_label = tk.Label(main_frame,
                                 text="Выберите компоненты для удаления:",
                                 font=("Arial", 12), fg='#ff3b30', bg='#182030')
-        warning_label.pack(pady=5)
+        warning_label.pack(fill=tk.X, pady=5)
+        self.page.wrap(warning_label)
 
         # Фрейм для чекбоксов
         checkboxes_frame = tk.Frame(main_frame, bg='#182030')
@@ -322,11 +279,12 @@ class UninstallWindow:
         info_label = tk.Label(main_frame,
                              text="Это действие нельзя отменить.\nВыбранные данные будут удалены.",
                              font=("Arial", 10), fg='white', bg='#182030')
-        info_label.pack(pady=5)
+        info_label.pack(fill=tk.X, pady=5)
+        self.page.wrap(info_label)
 
         # Кнопки
-        btn_frame = tk.Frame(main_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
             'font': ('Arial', 10),
@@ -354,12 +312,15 @@ class UninstallWindow:
 
         # Область логов (всегда видима)
         log_frame = tk.Frame(main_frame, bg='#182030')
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-        self.log_text = tk.Text(log_frame, height=8, width=40, highlightthickness=0,
+        self.log_text = tk.Text(log_frame, height=6, width=1, highlightthickness=0,
                                                  wrap=tk.WORD, bg='#15354D', fg='white',
                                                  font=("Courier", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def log_message(self, message):
         self.log_text.insert(tk.END, f"{message}\n")

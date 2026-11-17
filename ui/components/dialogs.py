@@ -1,206 +1,97 @@
+from core.ui_scaling import grab_when_visible
 import tkinter as tk
-from ui.components.button_styler import create_hover_button, apply_hover_effect
+from tkinter import font as tkfont, ttk
+from core.ui_scaling import snapshot
+from ui.components.button_styler import create_hover_button
+from ui.components.adaptive import AdaptivePage
 
-def show_message_dialog(parent, title, message, message_type="info"):
-    import platform, subprocess, os
+
+def restore_parent_focus(parent, previous_focus):
+    """Restore after the destroyed dialog has released the window-system focus."""
+    pending = {}
+
+    def cancel(event):
+        if event.widget is parent and pending.get('after'):
+            parent.after_cancel(pending.pop('after'))
+
+    def restore():
+        pending.pop('after', None)
+        parent.unbind('<Destroy>', pending['binding'])
+        if previous_focus.winfo_exists():
+            previous_focus.focus_force()
+
+    pending['binding'] = parent.bind('<Destroy>', cancel, add='+')
+    pending['after'] = parent.after_idle(restore)
+
+
+def _dialog(parent, title, message, question=False):
+    previous_focus = parent.focus_get()
+    previous_grab = parent.grab_current()
     dialog = tk.Toplevel(parent)
     dialog.title(title)
     dialog.configure(bg='#182030')
     dialog.transient(parent)
-    dialog.grab_set()
-
-    def is_steamdeck():
-        """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-        try:
-            if os.path.exists("/etc/os-release"):
-                with open("/etc/os-release") as f:
-                    os_info = f.read().lower()
-                    if "steamos" in os_info or "steam deck" in os_info:
-                        return True
-            sys_name = platform.uname().machine.lower()
-            if "steam" in sys_name or "deck" in sys_name:
-                return True
-            result = subprocess.run(["ps", "-A"], capture_output=True, text=True)
-            if "gamescope" in result.stdout.lower():
-                return True
-        except:
-            pass
-        return False
-
-    # Определяем размеры экрана
-    screen_width = dialog.winfo_screenwidth()
-    screen_height = dialog.winfo_screenheight()
-
-    # Рассчитываем параметры текста
-    lines = message.count('\n') + 1
-    max_line_length = max(len(line) for line in message.split('\n'))
-
-    # Минимальные размеры
-    min_width = 350
-    min_height = 110
-
-    # Автоувеличение в зависимости от длины
-    if max_line_length <= 40:
-        base_width = min_width
+    scale = snapshot(dialog)[4]
+    font = tkfont.Font(root=dialog, family='Arial', size=11)
+    text_width = max((font.measure(line) for line in message.splitlines()), default=0)
+    preferred = max(320, min(560, round(text_width / scale) + 40))
+    page = AdaptivePage(dialog, (preferred, 0), parent)
+    if len(message) > 1200:
+        message_frame = tk.Frame(page.body, bg='#182030')
+        message_frame.pack(fill='both', expand=True)
+        message_frame.grid_columnconfigure(0, weight=1)
+        message_frame.grid_rowconfigure(0, weight=1)
+        message_text = tk.Text(message_frame, font=('Arial', 11), bg='#182030', fg='white',
+                               wrap='word', width=1, height=1, bd=0, highlightthickness=0,
+                               padx=0, pady=0, cursor='arrow')
+        message_text.insert('1.0', message)
+        message_text.configure(state='disabled')
+        message_text.grid(row=0, column=0, sticky='nsew')
+        message_scrollbar = ttk.Scrollbar(message_frame, orient='vertical', command=message_text.yview)
+        message_text.configure(yscrollcommand=message_scrollbar.set)
+        page.text_block(message_text, message_scrollbar)
     else:
-        extra_chars = max_line_length - 40
-        base_width = min(600, min_width + extra_chars * 10)
+        message_label = tk.Label(page.body, text=message, font=('Arial', 11), bg='#182030',
+                                fg='white', justify=tk.LEFT, anchor='w',
+                                wraplength=max(40, round((preferred-40)*scale)))
+        message_label.pack(fill='x')
+        page.wrap(message_label)
+    result = [False]
 
-    base_height = min_height + (lines - 1) * 20
+    def close(value=False):
+        result[0] = value
+        dialog.destroy()
 
-    # Если экран в портретной ориентации — поменяем местами
-    if screen_height > screen_width:
-        screen_width, screen_height = screen_height, screen_width
+    def restore(event):
+        if event.widget is dialog:
+            if previous_grab is not None and previous_grab.winfo_exists():
+                previous_grab.grab_set()
+            if previous_focus is not None and previous_focus.winfo_exists():
+                restore_parent_focus(parent, previous_focus)
 
-    # Сохраняем размеры в переменные, но применим позже
-    if is_steamdeck():
-        # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-        width = min(base_width + 30, screen_width + 20)
-        height = min(base_height + 40, screen_height + 40)
-        # Без центрирования (иначе Wayland игнорирует позицию)
-        dialog.geometry(f"{int(width)}x{int(height)}")
-    else:
-        # На обычных системах (CachyOS, Windows, etc.)
-        width = base_width
-        height = base_height
-        dialog.geometry(f"{width}x{height}")
+    dialog.bind('<Destroy>', restore, add='+')
+    buttons = tk.Frame(page.footer, bg='#182030')
+    buttons.pack(fill='x')
+    style = dict(font=('Arial', 10), bg='#15354D', fg='white', bd=0,
+                 padx=20, pady=8, width=10, highlightthickness=0, cursor='hand2')
+    first = create_hover_button(buttons, text='Да' if question else 'OK', command=lambda: close(question), **style)
+    first.pack(side='left')
+    if question:
+        create_hover_button(buttons, text='Нет', command=close, **style).pack(side='left')
+    dialog.bind('<Return>', lambda e: close(question))
+    dialog.bind('<Escape>', lambda e: close())
+    dialog.protocol('WM_DELETE_WINDOW', close)
+    page.responsive_row(buttons, gap=10)
+    grab_when_visible(dialog)
+    first.focus_set()
+    return dialog, result
 
-    # Иконка и цвет в зависимости от типа
-    if message_type == "error":
-        color = "#ff3b30"
-    elif message_type == "warning":
-        color = "#ff9500"
-    elif message_type == "success":
-        color = "#30d158"
-    else:  # info
-        color = "#0a84ff"
 
-    # # Заголовок
-    # title_frame = tk.Frame(dialog, bg='#182030', pady=10)
-    # title_frame.pack(fill=tk.X)
-    #
-    # tk.Label(title_frame, text=title, font=("Arial", 12, "bold"),
-    #         bg='#182030', fg='white').pack()
-
-    # Сообщение
-    message_frame = tk.Frame(dialog, bg='#182030', pady=10)
-    message_frame.pack(fill=tk.BOTH, expand=True, padx=20)
-
-    # Динамический wraplength в зависимости от ширины окна
-    wraplength = int(width) - 60  # Отступы по 30px с каждой стороны
-
-    message_label = tk.Label(message_frame, text=message, font=("Arial", 11),
-                            bg='#182030', fg='white', wraplength=wraplength,
-                            justify=tk.LEFT)
-    message_label.pack(anchor=tk.W, fill=tk.BOTH, expand=True, pady=(10, 0))
-
-    # Кнопка OK
-    button_style = {
-        'font': ('Arial', 10),
-        'bg': '#15354D',
-        'fg': 'white',
-        'bd': 0,
-        'padx': 20,
-        'pady': 8,
-        'width': 10,
-        'highlightthickness': 0,
-        'cursor': 'hand2'
-    }
-
-    button_frame = tk.Frame(dialog, bg='#182030', pady=10)
-    button_frame.pack(fill=tk.X)
-
-    ok_button = create_hover_button(button_frame, text="OK", command=dialog.destroy, **button_style)
-    ok_button.pack(pady=(0, 10))
-
-    # Закрытие по Enter
-    dialog.bind('<Return>', lambda e: dialog.destroy())
-    ok_button.focus_set()
+def show_message_dialog(parent, title, message, message_type='info'):
+    _dialog(parent, title, message)
 
 
 def show_question_dialog(parent, title, message):
-    """Показывает кастомный вопрос с Yes/No"""
-    result = [False]
-
-    dialog = tk.Toplevel(parent)
-    dialog.title(title)
-    dialog.configure(bg='#182030')
-    dialog.transient(parent)
-    dialog.grab_set()
-
-    # Рассчитываем параметры текста
-    lines = message.count('\n') + 1
-    max_line_length = max(len(line) for line in message.split('\n'))
-
-    # Минимальные размеры
-    min_width = 350
-    min_height = 95
-
-    # Ширина: увеличиваем только если текст действительно длинный
-    if max_line_length <= 40:
-        width = min_width  # 350
-    else:
-        # Плавное увеличение для очень длинных строк
-        extra_chars = max_line_length - 40
-        width = min(600, min_width + extra_chars * 10)  # +4px за каждый лишний символ
-
-    # Высота: увеличиваем только при многострочном тексте
-    height = min_height + (lines - 1) * 25  # +25px за каждую дополнительную строку
-
-    dialog.geometry(f"{int(width)}x{int(height)}")
-    screen_width = dialog.winfo_screenwidth()
-    screen_height = dialog.winfo_screenheight()
-    dialog.maxsize(screen_width + 30, screen_height + 30)
-
-    # Сообщение
-    message_frame = tk.Frame(dialog, bg='#182030', pady=5)
-    message_frame.pack(fill=tk.BOTH, expand=True, padx=5)
-
-    message_label = tk.Label(message_frame, text=message, font=("Arial", 11),
-                            bg='#182030', fg='white', justify=tk.CENTER, anchor=tk.CENTER)
-    message_label.pack(expand=True, fill=tk.BOTH)
-
-    # Кнопки
-    button_frame = tk.Frame(dialog, bg='#182030', pady=15)
-    button_frame.pack(fill=tk.X)
-
-    def on_yes():
-        result[0] = True
-        dialog.destroy()
-
-    def on_no():
-        result[0] = False
-        dialog.destroy()
-
-    button_style = {
-        'font': ('Arial', 10),
-        'bg': '#15354D',
-        'fg': 'white',
-        'bd': 0,
-        'padx': 10,
-        'pady': 6,
-        'width': 8,
-        'highlightthickness':0,
-        'cursor': 'hand2'
-    }
-
-    yes_btn = create_hover_button(button_frame, text="Да",
-                                  command=on_yes, **button_style)
-    yes_btn.grid(row=0, column=1, padx=(0, 10))
-
-    no_btn = create_hover_button(button_frame, text="Нет",
-                                 command=on_no, **button_style)
-    no_btn.grid(row=0, column=2)
-
-    # Центрируем весь фрейм с кнопками
-    button_frame.grid_columnconfigure(0, weight=1)
-    button_frame.grid_columnconfigure(1, weight=1)
-    button_frame.grid_columnconfigure(2, weight=1)
-    button_frame.grid_columnconfigure(3, weight=1)
-
-    # Закрытие по клавишам
-    dialog.bind('<Return>', lambda e: on_yes())
-    dialog.bind('<Escape>', lambda e: on_no())
-
+    dialog, result = _dialog(parent, title, message, True)
     dialog.wait_window()
     return result[0]

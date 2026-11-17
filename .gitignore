@@ -1,1 +1,27 @@
-install_manager.sh
+# Python runtime caches
+__pycache__/
+*.py[cod]
+
+# Generated visual QA captures
+/artifacts/
+
+# Generated release archives
+/dist/
+
+# Local checks, tooling and working notes
+/tests/
+/scripts/
+/docs/
+/.agents/
+/.codex/
+/.aws/
+
+# Local Python environments and check output
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log

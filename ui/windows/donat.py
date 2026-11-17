@@ -1,3 +1,4 @@
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
 import webbrowser
 import os
@@ -13,58 +14,6 @@ class DonationWindow:
     def setup_window_properties(self):
         """Настройка свойств окна для корректного отображения"""
         self.root.title("Поддержать разработчика")
-
-        # --- Определяем окружение ---
-        def is_steamdeck():
-            """Проверяет, запущено ли приложение на Steam Deck или SteamOS"""
-            try:
-                # Проверяем /etc/os-release
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release") as f:
-                        os_info = f.read().lower()
-                        if "steamos" in os_info or "steam deck" in os_info:
-                            return True
-
-                # Проверяем по системному имени (fallback)
-                sys_name = platform.uname().machine.lower()
-                if "steam" in sys_name or "deck" in sys_name:
-                    return True
-
-                # Проверяем compositor (часто Gamescope)
-                result = subprocess.run(
-                    ["ps", "-A"], capture_output=True, text=True
-                )
-                if "gamescope" in result.stdout.lower():
-                    return True
-            except:
-                pass
-            return False
-
-        # --- Определяем размеры экрана ---
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        # Базовые размеры (оригинал)
-        base_width = 400
-        base_height = 430
-
-        # --- Учёт ориентации ---
-        if screen_height > screen_width:
-            # Портретная ориентация (например, у Steam Deck)
-            screen_width, screen_height = screen_height, screen_width
-
-        # --- Подстройка под Steam Deck / SteamOS ---
-        if is_steamdeck():
-            # На Steam Deck — чуть меньше, чтобы влезало в экран даже с рамкой
-            width = min(base_width + 20, screen_width + 20)
-            height = min(base_height + 30, screen_height + 40)
-            # Без центрирования (иначе Wayland игнорирует позицию)
-            self.root.geometry(f"{int(width)}x{int(height)}")
-        else:
-            # На обычных системах (CachyOS, Windows, etc.)
-            width = base_width
-            height = base_height
-            self.root.geometry(f"{width}x{height}")
 
         self.root.configure(bg='#182030')
         self.root.transient(self.parent)
@@ -88,8 +37,8 @@ class DonationWindow:
     def create_widgets(self):
         """Создает элементы интерфейса"""
         # Основной фрейм
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (430, 460), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         # Заголовок
         title_label = tk.Label(main_frame,
@@ -112,11 +61,12 @@ class DonationWindow:
                                   fg='white',
                                   wraplength=350,
                                   justify=tk.CENTER)
-        thank_you_label.pack(pady=(0, 15))
+        thank_you_label.pack(fill=tk.X, pady=(0, 15))
+        self.page.wrap(thank_you_label)
 
         # Фрейм для QR кода
         qr_frame = tk.Frame(main_frame, bg='#182030')
-        qr_frame.pack(pady=10)
+        qr_frame.pack(pady=5)
 
         # Загружаем QR код
         try:
@@ -127,7 +77,8 @@ class DonationWindow:
             if os.path.exists(qr_path):
                 self.qr_image = tk.PhotoImage(file=qr_path)
                 qr = tk.Label(qr_frame, image=self.qr_image, bg='#182030')
-                qr.pack(side=tk.LEFT, padx=(0, 10))
+                qr.pack()
+                self.page.register_image(qr, self.qr_image)
             else:
                 raise FileNotFoundError("QR код не найден")
 
@@ -148,11 +99,12 @@ class DonationWindow:
                              bg='#182030',
                              fg='#5BA06A',
                              justify=tk.CENTER)
-        qr_caption.pack(pady=(5, 15))
+        qr_caption.pack(fill=tk.X, pady=(5, 5))
+        self.page.wrap(qr_caption)
 
         # Кнопка закрытия
-        button_frame = tk.Frame(main_frame, bg='#182030')
-        button_frame.pack(fill=tk.X, pady=(10, 0))
+        button_frame = tk.Frame(self.page.footer, bg='#182030')
+        button_frame.pack(fill=tk.X, pady=(5, 0))
 
         close_style = {
             'font': ('Arial', 10),
@@ -175,6 +127,8 @@ class DonationWindow:
         # Обработка клавиш
         self.root.bind('<Escape>', lambda e: self.root.destroy())
         self.root.bind('<Return>', lambda e: self.root.destroy())
+
+        self.page.request_fit()
 
     def create_donation_link(self, parent, icon, text, command_func):
         """Создает ссылку для доната"""
