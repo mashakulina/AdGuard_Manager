@@ -1,3 +1,4 @@
+from ui.components.adaptive import AdaptivePage
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import subprocess
@@ -9,7 +10,7 @@ import platform
 import threading
 import shutil
 from core.auth import AuthWindow
-from core.utils import detect_os, detect_arch, get_latest_version, get_download_url
+from core.utils import detect_os, detect_arch, resolve_cli_release
 import sys
 from ui.components.button_styler import create_hover_button, apply_hover_effect
 
@@ -18,7 +19,6 @@ class AdGuardVPNInstaller:
         self.root = tk.Tk()
         self.setup_window_properties()
         self.root.title("Установка AdGuard VPN")
-        self.root.geometry("310x400")
         self.root.configure(bg='#182030')
 
         try:
@@ -56,8 +56,8 @@ class AdGuardVPNInstaller:
 
     def setup_ui(self):
         # Основной фрейм
-        main_frame = tk.Frame(self.root, bg='#182030', padx=20, pady=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.page = AdaptivePage(self.root, (430, 470), getattr(self, 'parent', None))
+        main_frame = self.page.body
 
         # Заголовок
         title_label = tk.Label(main_frame, text="AdGuard VPN Installer",
@@ -66,7 +66,7 @@ class AdGuardVPNInstaller:
 
         # Информация о системе
         info_frame = tk.Frame(main_frame, bg='#182030')
-        info_frame.pack(fill=tk.X, pady=10)
+        info_frame.pack(fill=tk.X, pady=5)
 
         try:
             os_info = detect_os()
@@ -75,21 +75,27 @@ class AdGuardVPNInstaller:
         except Exception as e:
             sys_info = f"Ошибка определения системы: {str(e)}"
 
-        tk.Label(info_frame, text=sys_info, fg='white', bg='#182030').pack(anchor=tk.W)
-        tk.Label(info_frame, text="Будет установлено в: /opt/adguardvpn_cli",
-                fg='white', bg='#182030').pack(anchor=tk.W, pady=(5, 0))
+        system_label = tk.Label(info_frame, text=sys_info, fg='white', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        system_label.pack(fill=tk.X)
+        self.page.wrap(system_label)
+        path_label = tk.Label(info_frame, text="Будет установлено в: /opt/adguardvpn_cli",
+                fg='white', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        path_label.pack(fill=tk.X, pady=(5, 0))
+        self.page.wrap(path_label)
 
         # Фрейм установки
         install_frame = tk.Frame(main_frame, bg='#182030')
-        install_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        install_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        tk.Label(install_frame,
+        instructions_label = tk.Label(install_frame,
                 text="Нажмите 'Установить' для начала\nустановки AdGuard VPN",
-                font=("Arial", 10), fg='white', bg='#182030', justify=tk.LEFT).pack(anchor=tk.W, pady=5)
+                font=("Arial", 10), fg='white', bg='#182030', justify=tk.LEFT, anchor=tk.W)
+        instructions_label.pack(fill=tk.X, pady=5)
+        self.page.wrap(instructions_label)
 
         # Кнопки установки
-        btn_frame = tk.Frame(install_frame, bg='#182030')
-        btn_frame.pack(fill=tk.X, pady=15)
+        btn_frame = tk.Frame(self.page.footer, bg='#182030')
+        btn_frame.pack(fill=tk.X, pady=5)
 
         button_style = {
             'font': ('Arial', 10),
@@ -120,12 +126,15 @@ class AdGuardVPNInstaller:
 
         # Текстовое поле для логов
         log_frame = tk.Frame(install_frame, bg='#182030')
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        self.log_text = tk.Text(log_frame, height=8, width=60,
+        self.log_text = tk.Text(log_frame, height=7, width=1,
                                                  wrap=tk.WORD, bg='#15354D', fg='white', highlightthickness=0,
                                                  font=("Courier", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        self.page.responsive_row(btn_frame)
+        self.page.request_fit()
 
     def close_app(self):
         sys.exit()
@@ -184,22 +193,16 @@ class AdGuardVPNInstaller:
         try:
             self.root.after(0, lambda: self.log_message("=== Начало установки AdGuard VPN ==="))
 
-            # Разблокируем файловую систему
-            if not self.unlock_filesystem():
-                raise Exception("Не удалось разблокировать файловую систему")
-
-            # Получаем версию
-            version = get_latest_version()
-
-            # Определяем ОС и архитектуру
+            # Resolve the official release before any privileged/system changes.
             os_type = platform.system().lower()
             arch = detect_arch()
-
+            version, download_url, package_name = resolve_cli_release(os_type, arch)
             self.root.after(0, lambda: self.log_message(f"Версия: {version}"))
             self.root.after(0, lambda: self.log_message(f"ОС: {os_type}, Архитектура: {arch}"))
 
-            # Получаем URL для скачивания
-            download_url, package_name = get_download_url(os_type, arch, version)
+            if not self.unlock_filesystem():
+                raise Exception("Не удалось разблокировать файловую систему")
+
             self.root.after(0, lambda: self.log_message(f"Пакет: {package_name}"))
             self.root.after(0, lambda: self.log_message(f"URL для скачивания: {download_url}"))
 
@@ -212,11 +215,15 @@ class AdGuardVPNInstaller:
                 self.root.after(0, lambda: self._install_fail("Ошибка установки"))
 
         except Exception as e:
-            self.root.after(0, lambda: self._install_fail(f"Ошибка: {str(e)}"))
+            self.root.after(0, lambda message=str(e): self._install_fail(f"Ошибка: {message}"))
         finally:
             # Всегда блокируем файловую систему обратно, если установка не завершена успешно
-            if not self.installation_complete:
+            if self.filesystem_unlocked and not self.installation_complete:
                 self.lock_filesystem()
+
+    def _install_fail(self, message):
+        self.installation_complete = False
+        self.log_message(f"❌ {message}")
 
     def download_and_install(self, download_url, package_name, version):
         try:

@@ -14,10 +14,18 @@
 ## Установка
 Для работы нужен `sudo` пароль. Если ранее пароль не был установлен, то это можно сделать через консоль, используя команду `passwd`
 
-1. Скачать архив [install_manager.tar.gz](https://raw.githubusercontent.com/mashakulina/AdGuard_Manager/main/install_manager.tar.gz)
-2. Распаковать в удобном месте
-3. Запустить двойным кликом по файлу `install_manager.sh`
-Далее следовать инструкциям установки и авторизации.
+1. Скачать [AdGuard_VPN_Manager_Install.desktop](https://raw.githubusercontent.com/mashakulina/AdGuard_Manager/main/AdGuard_VPN_Manager_Install.desktop).
+2. Открыть скачанный файл. Если рабочий стол попросит разрешить запуск, подтвердить его.
+3. Дождаться скачивания и распаковки менеджера, затем следовать инструкциям установки CLI и авторизации.
+
+Ярлык сам загружает установщик и запускает его в терминале. Менеджер устанавливается
+в `~/AdGuard VPN Manager`. При чистой установке CLI выбирается последняя стабильная
+версия из официального источника AdGuard. Если определить её не удаётся,
+установщик показывает ошибку и не подставляет старую версию.
+
+Можно установить и вручную: скачать
+[install_manager.tar.gz](https://raw.githubusercontent.com/mashakulina/AdGuard_Manager/main/install_manager.tar.gz),
+распаковать и запустить `install_manager.sh`.
 В меню пуск и на рабочем столе появятся ярлыки.
 
 ## Управление
